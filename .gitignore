@@ -1,0 +1,7 @@
+# debugging stuff that isnt part of the program
+debug.h
+*.log
+
+# compilation products
+svi
+*.o
