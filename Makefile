@@ -2,7 +2,6 @@
 
 CC      = cc
 SRC     = svi.c
-HEADERS = termbox2.h
 
 PREFIX  = /usr/local
 
@@ -10,7 +9,7 @@ WFLAGS  = -Wall -Wextra -Wdeclaration-after-statement -Wshadow -Wpointer-arith -
 
 CFLAGS  = -std=c89 -pedantic -Os -g -Werror ${WFLAGS}
 
-svi: ${SRC} ${HEADERS}
+svi: ${SRC}
 	${CC} ${CFLAGS} -o svi ${SRC}
 install: svi
 	mkdir -p ${DESTDIR}${PREFIX}/bin
