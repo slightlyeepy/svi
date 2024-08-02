@@ -27,7 +27,6 @@
 
 /*
  * TODO (from highest to lowest priority):
- * - test on another platform (most likely BSD)
  * - command mode
  * - writing to file
  * - opening files
@@ -68,9 +67,26 @@
 
 /*
  * how long to wait for the terminal's response when getting the size with
- * the fallback method. cant be higher than 1000
+ * the fallback method. cant be higher than 999
  */
-#define RESIZE_FALLBACK_MS 1000
+#define RESIZE_FALLBACK_MS 500
+
+/*
+ * ===========================================================================
+ * compatibility with certain platforms
+ */
+
+#include <sys/param.h>
+#if defined(BSD)
+/* BSD needs _BSD_SOURCE for SIGWINCH */
+#define _BSD_SOURCE
+#endif /* BSD */
+
+#if defined(__dietlibc__) && defined(__x86_64__)
+/* needed to work around a bug in dietlibc */
+#include <stdint.h>
+typedef uint64_t __u64;
+#endif /* __dietlibc__ && __x86_64__ */
 
 /*
  * ===========================================================================
