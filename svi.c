@@ -30,6 +30,7 @@
  * - better error handling, don't exit if the error can be handled
  * - command mode
  * - writing to file
+ * - opening files
  * - UTF-8 support
  * - maybe try to handle OOM more gracefully instead of exiting instantly
  */
@@ -66,6 +67,9 @@
 #define ROW_SIZE_INCREMENT  64  /* dont make this 0, stuff will break */
 
 /* terminal */
+#define FALLBACK_WIDTH  80
+#define FALLBACK_HEIGHT 24
+
 #define COLOR_DEFAULT NULL
 #define COLOR_RESET   "\033[0m"
 #define COLOR_BLACK   "\033[30m"
@@ -137,14 +141,14 @@ static void *ereallocarray(void *ptr, size_t nmemb, size_t size);
 static void die(const char *fmt, ...);
 
 /* terminal */
-static int maybe_read_chr(char *c);
 static void readkey(struct term_event *ev);
 static void term_event_wait(struct term_event *ev);
 static void term_init(void);
 static void term_print(int x, int y, const char *color, const char *str);
 static void term_set_cursor(int x, int y);
 static void term_shutdown(void);
-static void term_size(int size[2]);
+static int term_size(int size[2]);
+static int try_read_chr(char *c);
 #if defined(SIGWINCH)
 static void winch(int unused);
 #endif /* SIGWINCH */
@@ -249,18 +253,6 @@ die(const char *fmt, ...)
  * ===========================================================================
  * terminal
  */
-static int
-maybe_read_chr(char *c)
-{
-	if (read(STDIN_FILENO, c, 1) < 0) {
-		if (errno == EAGAIN)
-			return 0;
-		else
-			die("read:");
-	}
-	return 1;
-}
-
 static void
 readkey(struct term_event *ev)
 {
@@ -269,11 +261,11 @@ readkey(struct term_event *ev)
 		read(STDIN_FILENO, &c, 1);
 		switch (c) {
 		case '\033':
-			if (maybe_read_chr(&c)) {
-				if (c == '[' && maybe_read_chr(&c)) {
+			if (try_read_chr(&c)) {
+				if (c == '[' && try_read_chr(&c)) {
 					switch (c) {
 					case '3':
-						if (maybe_read_chr(&c) &&
+						if (try_read_chr(&c) &&
 								c == '~') {
 							ev->key = KEY_DELETE;
 							return;
@@ -435,7 +427,7 @@ term_shutdown(void)
 	term_clear();
 }
 
-static void
+static int
 term_size(int size[2])
 {
 	char buf[16];
@@ -448,7 +440,7 @@ term_size(int size[2])
 			sz.ws_col && sz.ws_row) {
 		size[0] = sz.ws_col;
 		size[1] = sz.ws_row;
-		return;
+		return 0;
 	}
 #endif /* TIOCGWINSZ */
 	/*
@@ -457,19 +449,27 @@ term_size(int size[2])
 	 */
 	for (; i < sizeof(buf) && c != 'R'; ++i) {
 		if (read(STDIN_FILENO, &c, 1) < 0)
-			die("failed to get terminal size: read:");
+			return -1;
 		buf[i] = c;
 	}
 	if (i < 2 || i == sizeof(buf))
-		die("failed to get terminal size");
+		return -1;
 	buf[i] = '\0';
-	errno = 0;
-	if (sscanf(buf, "\033[%d;%dR", &size[1], &size[0]) != 2) {
-		if (errno)
-			die("failed to get terminal size: sscanf:");
+	if (sscanf(buf, "\033[%d;%dR", &size[1], &size[0]) != 2)
+		return -1;
+	return 0;
+}
+
+static int
+try_read_chr(char *c)
+{
+	if (read(STDIN_FILENO, c, 1) < 0) {
+		if (errno == EAGAIN)
+			return 0;
 		else
-			die("failed to get terminal size");
+			die("read:");
 	}
+	return 1;
 }
 
 #if defined(SIGWINCH)
@@ -639,14 +639,20 @@ run(void)
 	size_t i = 0; /* DEBUG */
 
 	buf_create(&buf, INITIAL_BUFFER_ROWS);
-	term_size(size);
+	if (term_size(size) < 0) {
+		size[0] = FALLBACK_WIDTH;
+		size[1] = FALLBACK_HEIGHT;
+	}
 
 	while (!done) {
 		term_event_wait(&ev);
 
 		switch (ev.type) {
 		case TERM_EVENT_RESIZE:
-			term_size(size);
+			if (term_size(size) < 0) {
+				size[0] = FALLBACK_WIDTH;
+				size[1] = FALLBACK_HEIGHT;
+			}
 
 			/*
 			 * check if current cursor position is now
@@ -655,8 +661,8 @@ run(void)
 			 */
 			if (x > size[0])
 				x = size[0];
-			if (y > size[1])
-				y = size[1];
+			if (y > size[1] - 1)
+				y = size[1] - 1;
 
 			break;
 		case TERM_EVENT_KEY:
@@ -676,7 +682,7 @@ run(void)
 				break;
 			case KEY_ARROW_DOWN:
 				/* move cursor down */
-				if (y < size[1]) {
+				if (y < size[1] - 1) {
 					size_t elen = elem_len(buf, ++y);
 					if ((size_t)x > elen)
 						x = (int)elen;
@@ -696,7 +702,7 @@ run(void)
 				break;
 			case KEY_ENTER:
 				/* go to next line */
-				if (y < size[1]) {
+				if (y < size[1] - 1) {
 					x = 0;
 					term_set_cursor(x, ++y);
 				}
