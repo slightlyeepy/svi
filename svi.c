@@ -60,17 +60,19 @@
  */
 
 /* buffer size */
-#define INITIAL_BUFFER_ROWS 32 /* dont make this 0, stuff will break */
-#define BUF_SIZE_INCREMENT  16 /* dont make this 0, stuff will break */
+#define INITIAL_BUFFER_ROWS 32  /* must not be 0 */
+#define BUF_SIZE_INCREMENT  16  /* must not be 0 */
 
-#define INITIAL_ROW_SIZE    128 /* dont make this 0 or 1, stuff will break */
-#define ROW_SIZE_INCREMENT  64  /* dont make this 0, stuff will break */
+#define INITIAL_ROW_SIZE    128 /* must not be 0 or 1 */
+#define ROW_SIZE_INCREMENT  64  /* must not be 0 */
 
 /* terminal */
 #define FALLBACK_WIDTH  80
 #define FALLBACK_HEIGHT 24
 
-#define COLOR_DEFAULT NULL
+#define RESIZE_FALLBACK_MS 1000 /* must not be higher than 1000 */
+
+#define COLOR_DEFAULT NULL      /* must be NULL */
 #define COLOR_RESET   "\033[0m"
 #define COLOR_BLACK   "\033[30m"
 #define COLOR_RED     "\033[31m"
@@ -82,18 +84,19 @@
 #define COLOR_WHITE   "\033[37m"
 
 #define term_clear() write(STDOUT_FILENO, "\033[2J\033[;H", 8)
-#define term_pos_restore() write(STDOUT_FILENO, "\033[u", 3)
-#define term_pos_save() write(STDOUT_FILENO, "\033[s", 3)
 
 /* buffer management */
-#define elem_len(buf, elem) ((buf.b[elem]) ? buf.b[elem]->len : 0)
+#define buf_elem_len(buf, elem) ((buf.b[elem]) ? buf.b[elem]->len : 0)
+#define buf_elem_notempty(buf, elem) (buf.b[elem] && buf.b[elem]->len)
 
 /* utility */
 #define roundupto(x, multiple) (((x + multiple - 1) / multiple) * multiple)
 
 /* enums */
 enum event_type {
+#if defined(SIGWINCH)
 	TERM_EVENT_RESIZE,
+#endif /* SIGWINCH */
 	TERM_EVENT_KEY
 };
 
@@ -297,9 +300,13 @@ readkey(struct term_event *ev)
 			ev->key = KEY_BACKSPACE;
 			return;
 		default:
-			ev->key = KEY_CHAR;
-			ev->ch = c;
-			return;
+			/* currently only ASCII is supported */
+			if (c < 0x7f) {
+				ev->key = KEY_CHAR;
+				ev->ch = c;
+				return;
+			}
+			break;
 		}
 	}
 }
@@ -307,18 +314,18 @@ readkey(struct term_event *ev)
 static void
 term_event_wait(struct term_event *ev)
 {
-#if defined(SIGWINCH)
-	/* do pselect() to wait for SIGWINCH or data on stdin */
 	fd_set rfds;
 	int rv;
 
 	FD_ZERO(&rfds);
 	FD_SET(STDIN_FILENO, &rfds);
-	
+#if defined(SIGWINCH)
+	/* do pselect() to wait for SIGWINCH or data on stdin */
 	rv = pselect(1, &rfds, NULL, NULL, NULL, &oldmask);
 	if (rv < 0) {
 		if (errno == EINTR && win_resized) {
 			/* got SIGWINCH */
+			win_resized = 0;
 			ev->type = TERM_EVENT_RESIZE;
 			return;
 		} else {
@@ -333,8 +340,18 @@ term_event_wait(struct term_event *ev)
 		die("pselect: timeout");
 	}
 #else
-	ev->type = TERM_EVENT_KEY;
-	readkey(ev);
+	/* do select() to wait for data on stdin */
+	rv = select(1, &rfds, NULL, NULL, NULL);
+	if (rv < 0) {
+		die("select:");
+	} else if (rv) {
+		/* data available on stdin */
+		ev->type = TERM_EVENT_KEY;
+		readkey(ev);
+	} else {
+		/* ... can this even happen? */
+		die("select: timeout");
+	}
 #endif /* SIGWINCH */
 }
 
@@ -430,9 +447,13 @@ term_shutdown(void)
 static int
 term_size(int size[2])
 {
+	fd_set rfds;
+	struct timeval timeout;
+
 	char buf[16];
 	char c = 0;
 	size_t i = 0;
+
 #if defined(TIOCGWINSZ)
 	/* if we have TIOCGWINSZ, find the window size with it */
 	struct winsize sz;
@@ -443,10 +464,23 @@ term_size(int size[2])
 		return 0;
 	}
 #endif /* TIOCGWINSZ */
+
 	/*
 	 * if that failed or we don't have it, fall back to using
 	 * escape sequences
 	 */
+	if (write(STDOUT_FILENO, "\033[9999;9999H\033[6n", 16) != 16)
+		return -1;
+
+	FD_ZERO(&rfds);
+	FD_SET(STDIN_FILENO, &rfds);
+
+	timeout.tv_sec = 0;
+	timeout.tv_usec = RESIZE_FALLBACK_MS * 1000;
+
+	if (select(1, &rfds, NULL, NULL, &timeout) < 1)
+		return -1;
+
 	for (; i < sizeof(buf) && c != 'R'; ++i) {
 		if (read(STDIN_FILENO, &c, 1) < 0)
 			return -1;
@@ -648,6 +682,7 @@ run(void)
 		term_event_wait(&ev);
 
 		switch (ev.type) {
+#if defined(SIGWINCH)
 		case TERM_EVENT_RESIZE:
 			if (term_size(size) < 0) {
 				size[0] = FALLBACK_WIDTH;
@@ -659,12 +694,13 @@ run(void)
 			 * outside the window, might happen if it
 			 * was resized to be smaller
 			 */
-			if (x > size[0])
-				x = size[0];
-			if (y > size[1] - 1)
+			if (x >= size[0] - 1)
+				x = size[0] - 1;
+			if (y >= size[1] - 1)
 				y = size[1] - 1;
 
 			break;
+#endif /* SIGWINCH */
 		case TERM_EVENT_KEY:
 			switch (ev.key) {
 			case KEY_ESC:
@@ -674,7 +710,7 @@ run(void)
 			case KEY_ARROW_UP:
 				/* move cursor up */
 				if (y > 0) {
-					size_t elen = elem_len(buf, --y);
+					size_t elen = buf_elem_len(buf, --y);
 					if ((size_t)x > elen)
 						x = (int)elen;
 					term_set_cursor(x, y);
@@ -683,7 +719,7 @@ run(void)
 			case KEY_ARROW_DOWN:
 				/* move cursor down */
 				if (y < size[1] - 1) {
-					size_t elen = elem_len(buf, ++y);
+					size_t elen = buf_elem_len(buf, ++y);
 					if ((size_t)x > elen)
 						x = (int)elen;
 					term_set_cursor(x, y);
@@ -691,8 +727,8 @@ run(void)
 				break;
 			case KEY_ARROW_RIGHT:
 				/* move cursor right */
-				if (x < size[0] &&
-						(size_t)x < elem_len(buf, y))
+				if (x < size[0] - 1 &&
+					(size_t)x < buf_elem_len(buf, y))
 					term_set_cursor(++x, y);
 				break;
 			case KEY_ARROW_LEFT:
@@ -701,15 +737,19 @@ run(void)
 					term_set_cursor(--x, y);
 				break;
 			case KEY_ENTER:
-				/* go to next line */
+				/* go to next row */
 				if (y < size[1] - 1) {
 					x = 0;
 					term_set_cursor(x, ++y);
 				}
 				break;
 			case KEY_BACKSPACE:
-				/* remove char behind cursor */
-				if (x > 0) {
+				/*
+				 * remove char behind cursor, if it's not
+				 * at the beginning of the row and there's
+				 * some text on the current row
+				 */
+				if (x > 0 && buf_elem_notempty(buf, y)) {
 					buf_char_remove(&buf, (size_t)(y),
 							(size_t)(x - 1));
 					term_print(0, y, COLOR_DEFAULT,
@@ -718,28 +758,31 @@ run(void)
 				}
 				break;
 			case KEY_DELETE:
-				/* remove char at cursor */
-				buf_char_remove(&buf, (size_t)y,
-						(size_t)x);
-				term_pos_save();
-				term_print(0, y, COLOR_DEFAULT, buf.b[y]->s);
-				term_pos_restore();
+				/*
+				 * remove char at cursor, if there's some
+				 * text on the current row
+				 */
+				if (buf_elem_notempty(buf, y)) {
+					buf_char_remove(&buf, (size_t)y,
+							(size_t)x);
+					term_print(0, y, COLOR_DEFAULT,
+							buf.b[y]->s);
+					term_set_cursor(x, y);
+				}
 				break;
 			case KEY_CHAR:
 				/* regular key */
-				if ((size_t)y >= buf.size)
-					buf_resize(&buf, (size_t)roundupto(y,
-						BUF_SIZE_INCREMENT));
-				buf_char_insert(&buf, (size_t)y, ev.ch,
-						(size_t)x);
-				term_print(0, y, COLOR_DEFAULT, buf.b[y]->s);
-				if (x <= size[0]) {
-					++x;
-				} else {
-					x = 0;
-					++y;
+				if (x < size[0] - 1) {
+					if ((size_t)y >= buf.size)
+						buf_resize(&buf,
+							(size_t)roundupto(y,
+							BUF_SIZE_INCREMENT));
+					buf_char_insert(&buf, (size_t)y,
+							ev.ch, (size_t)x);
+					term_print(0, y, COLOR_DEFAULT,
+							buf.b[y]->s);
+					term_set_cursor(++x, y);
 				}
-				term_set_cursor(x, y);
 				break;
 			}
 		}
