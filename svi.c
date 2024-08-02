@@ -27,13 +27,50 @@
 
 /*
  * TODO (from highest to lowest priority):
- * - better error handling, don't exit if the error can be handled
+ * - test on another platform (most likely BSD)
  * - command mode
  * - writing to file
  * - opening files
  * - UTF-8 support
  * - maybe try to handle OOM more gracefully instead of exiting instantly
  */
+
+/*
+ * ===========================================================================
+ * configurable macros
+ */
+
+/*
+ * ===================
+ * editing buffer
+ */
+
+/* how many rows to initially allocate for the buffer, cant be 0 */
+#define INITIAL_BUFFER_ROWS 32
+
+/* how many rows to add to the buffer's size when it's too small, cant be 0 */
+#define BUF_SIZE_INCREMENT  16
+
+/* how many columns to initially allocate for each row, cant be 0 or 1 */
+#define INITIAL_ROW_SIZE    128
+
+/* how many columns to add to a row's size when it's too small, cant be 0 */
+#define ROW_SIZE_INCREMENT  64
+
+/*
+ * ===================
+ * terminal
+ */
+
+/* if getting the terminal's size fails, the following size is used instead */
+#define FALLBACK_WIDTH  80
+#define FALLBACK_HEIGHT 24
+
+/*
+ * how long to wait for the terminal's response when getting the size with
+ * the fallback method. cant be higher than 1000
+ */
+#define RESIZE_FALLBACK_MS 1000
 
 /*
  * ===========================================================================
@@ -59,20 +96,8 @@
  * macros and types
  */
 
-/* buffer size */
-#define INITIAL_BUFFER_ROWS 32  /* must not be 0 */
-#define BUF_SIZE_INCREMENT  16  /* must not be 0 */
-
-#define INITIAL_ROW_SIZE    128 /* must not be 0 or 1 */
-#define ROW_SIZE_INCREMENT  64  /* must not be 0 */
-
 /* terminal */
-#define FALLBACK_WIDTH  80
-#define FALLBACK_HEIGHT 24
-
-#define RESIZE_FALLBACK_MS 1000 /* must not be higher than 1000 */
-
-#define COLOR_DEFAULT NULL      /* must be NULL */
+#define COLOR_DEFAULT NULL
 #define COLOR_RESET   "\033[0m"
 #define COLOR_BLACK   "\033[30m"
 #define COLOR_RED     "\033[31m"
@@ -83,14 +108,10 @@
 #define COLOR_CYAN    "\033[36m"
 #define COLOR_WHITE   "\033[37m"
 
-#define term_clear() write(STDOUT_FILENO, "\033[2J\033[;H", 8)
-
-/* buffer management */
-#define buf_elem_len(buf, elem) ((buf.b[elem]) ? buf.b[elem]->len : 0)
-#define buf_elem_notempty(buf, elem) (buf.b[elem] && buf.b[elem]->len)
+#define TERM_CLEAR() write(STDOUT_FILENO, "\033[2J\033[;H", 8)
 
 /* utility */
-#define roundupto(x, multiple) (((x + multiple - 1) / multiple) * multiple)
+#define ROUNDUPTO(x, multiple) (((x + multiple - 1) / multiple) * multiple)
 
 /* enums */
 enum event_type {
@@ -165,6 +186,7 @@ static void buf_char_insert(struct buf *buf, size_t elem, char c,
 		size_t index);
 static void buf_char_remove(struct buf *buf, size_t elem, size_t index);
 static void buf_create(struct buf *buf, size_t size);
+static size_t buf_elem_len(struct buf *buf, size_t elem);
 static void buf_free(const struct buf *buf);
 static void buf_resize(struct buf *buf, size_t size);
 
@@ -403,7 +425,7 @@ term_init(void)
 		die("sigprocmask:");
 #endif /* SIGWINCH */
 
-	term_clear();
+	TERM_CLEAR();
 	term_initialized = 1;
 }
 
@@ -441,7 +463,7 @@ term_shutdown(void)
 	if (fcntl(STDIN_FILENO, F_SETFL, old_stdin_flags) < 0)
 		die("fcntl:");
 
-	term_clear();
+	TERM_CLEAR();
 }
 
 static int
@@ -610,6 +632,12 @@ buf_create(struct buf *buf, size_t size)
 	buf->size = size;
 }
 
+static size_t
+buf_elem_len(struct buf *buf, size_t elem)
+{
+	return (buf->b[elem]) ? buf->b[elem]->len : 0;
+}
+
 static void
 buf_free(const struct buf *buf)
 {
@@ -677,6 +705,7 @@ run(void)
 		size[0] = FALLBACK_WIDTH;
 		size[1] = FALLBACK_HEIGHT;
 	}
+	term_set_cursor(0, 0);
 
 	while (!done) {
 		term_event_wait(&ev);
@@ -710,7 +739,8 @@ run(void)
 			case KEY_ARROW_UP:
 				/* move cursor up */
 				if (y > 0) {
-					size_t elen = buf_elem_len(buf, --y);
+					size_t elen = buf_elem_len(&buf,
+							(size_t)--y);
 					if ((size_t)x > elen)
 						x = (int)elen;
 					term_set_cursor(x, y);
@@ -719,7 +749,8 @@ run(void)
 			case KEY_ARROW_DOWN:
 				/* move cursor down */
 				if (y < size[1] - 1) {
-					size_t elen = buf_elem_len(buf, ++y);
+					size_t elen = buf_elem_len(&buf,
+							(size_t)++y);
 					if ((size_t)x > elen)
 						x = (int)elen;
 					term_set_cursor(x, y);
@@ -728,7 +759,8 @@ run(void)
 			case KEY_ARROW_RIGHT:
 				/* move cursor right */
 				if (x < size[0] - 1 &&
-					(size_t)x < buf_elem_len(buf, y))
+					(size_t)x < buf_elem_len(&buf,
+						(size_t)y))
 					term_set_cursor(++x, y);
 				break;
 			case KEY_ARROW_LEFT:
@@ -749,7 +781,7 @@ run(void)
 				 * at the beginning of the row and there's
 				 * some text on the current row
 				 */
-				if (x > 0 && buf_elem_notempty(buf, y)) {
+				if (x > 0 && buf.b[y] && buf.b[y]->len) {
 					buf_char_remove(&buf, (size_t)(y),
 							(size_t)(x - 1));
 					term_print(0, y, COLOR_DEFAULT,
@@ -762,7 +794,7 @@ run(void)
 				 * remove char at cursor, if there's some
 				 * text on the current row
 				 */
-				if (buf_elem_notempty(buf, y)) {
+				if (buf.b[y] && buf.b[y]->len) {
 					buf_char_remove(&buf, (size_t)y,
 							(size_t)x);
 					term_print(0, y, COLOR_DEFAULT,
@@ -775,7 +807,7 @@ run(void)
 				if (x < size[0] - 1) {
 					if ((size_t)y >= buf.size)
 						buf_resize(&buf,
-							(size_t)roundupto(y,
+							(size_t)ROUNDUPTO(y,
 							BUF_SIZE_INCREMENT));
 					buf_char_insert(&buf, (size_t)y,
 							ev.ch, (size_t)x);
