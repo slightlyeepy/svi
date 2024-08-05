@@ -27,7 +27,7 @@
 
 /*
  * TODO (from highest to lowest priority):
- * - movement keys in normal mode
+ * - pledge() support for openbsd
  * - opening files
  * - UTF-8 support
  * - maybe try to handle OOM more gracefully instead of exiting instantly
@@ -241,6 +241,15 @@ static void buf_free(const struct buf *buf);
 static void buf_resize(struct buf *buf, size_t size);
 static int buf_write(const struct buf *buf, const char *filename,
 		int overwrite);
+
+/* movement */
+static void cursor_up(struct state *st);
+static void cursor_down(struct state *st);
+static void cursor_right(struct state *st);
+static void cursor_left(struct state *st);
+static void cursor_start(struct state *st);
+static void cursor_end(struct state *st);
+static void cursor_startnextrow(struct state *st);
 
 /* commands */
 static const char *cmdarg(const char *cmd);
@@ -815,6 +824,78 @@ buf_write(const struct buf *buf, const char *filename, int overwrite)
 
 /*
  * ============================================================================
+ * movement
+ */
+static void
+cursor_up(struct state *st)
+{
+	if (st->y > 0) {
+		size_t elen = buf_elem_len(&st->buf, (size_t)--(st->y));
+		if ((size_t)st->x > elen)
+			st->x = (int)elen;
+		term_set_cursor(st->x, st->y);
+	}
+}
+
+static void
+cursor_down(struct state *st)
+{
+	/*
+	 * height is subtracted by 2 since we have to reserve the
+	 * last row for the command text or mode indicator
+	 */
+	if (st->y < st->size[1] - 2) {
+		size_t elen = buf_elem_len(&st->buf, (size_t)++st->y);
+		if ((size_t)st->x > elen)
+			st->x = (int)elen;
+		term_set_cursor(st->x, st->y);
+	}
+}
+
+static void
+cursor_right(struct state *st)
+{
+	if (st->x < st->size[0] - 1 && (size_t)st->x < buf_elem_len(&st->buf,
+				(size_t)st->y))
+		term_set_cursor(++st->x, st->y);
+}
+
+static void
+cursor_left(struct state *st)
+{
+	if (st->x > 0)
+		term_set_cursor(--(st->x), st->y);
+}
+
+static void
+cursor_start(struct state *st)
+{
+	st->x = 0;
+	term_set_cursor(st->x, st->y);
+}
+
+static void
+cursor_end(struct state *st)
+{
+	size_t l = buf_elem_len(&st->buf, (size_t)st->y);
+	if (l)
+		--l;
+	st->x = (int)l;
+	term_set_cursor(st->x, st->y);
+}
+
+static void
+cursor_startnextrow(struct state *st)
+{
+	/* same as earlier, subtract 2 to reserve one row */
+	if (st->y < st->size[1] - 2) {
+		st->x = 0;
+		term_set_cursor(st->x, ++st->y);
+	}
+}
+
+/*
+ * ============================================================================
  * commands
  */
 static const char *
@@ -934,43 +1015,19 @@ key_insert(struct state *st)
 		term_set_cursor(st->x, st->y);
 		break;
 	case KEY_ARROW_UP:
-		/* move cursor up */
-		if (st->y > 0) {
-			size_t elen = buf_elem_len(&st->buf,
-					(size_t)--(st->y));
-			if ((size_t)st->x > elen)
-				st->x = (int)elen;
-			term_set_cursor(st->x, st->y);
-		}
+		cursor_up(st);
 		break;
 	case KEY_ARROW_DOWN:
-		/* move cursor down */
-		if (st->y < st->size[1] - 2) {
-			size_t elen = buf_elem_len(&st->buf,
-					(size_t)++(st->y));
-			if ((size_t)st->x > elen)
-				st->x = (int)elen;
-			term_set_cursor(st->x, st->y);
-		}
+		cursor_down(st);
 		break;
 	case KEY_ARROW_RIGHT:
-		/* move cursor right */
-		if (st->x < st->size[0] - 1 &&
-				(size_t)st->x < buf_elem_len(&st->buf,
-					(size_t)st->y))
-			term_set_cursor(++(st->x), st->y);
+		cursor_right(st);
 		break;
 	case KEY_ARROW_LEFT:
-		/* move cursor left */
-		if (st->x > 0)
-			term_set_cursor(--(st->x), st->y);
+		cursor_left(st);
 		break;
 	case KEY_ENTER:
-		/* go to next row */
-		if (st->y < st->size[1] - 2) {
-			st->x = 0;
-			term_set_cursor(st->x, ++(st->y));
-		}
+		cursor_startnextrow(st);
 		break;
 	case KEY_BACKSPACE:
 		/*
@@ -1013,7 +1070,7 @@ key_insert(struct state *st)
 					(size_t)st->x);
 			term_print(0, st->y, COLOR_DEFAULT,
 					st->buf.b[st->y]->s);
-			term_set_cursor(++(st->x), st->y);
+			term_set_cursor(++st->x, st->y);
 		}
 		break;
 	default:
@@ -1039,7 +1096,7 @@ key_normal(struct state *st)
 			/* move cursor right */
 			if (st->x < st->size[0] - 1 && (size_t)(st->x - 1) <
 					st->cmd.len)
-				term_set_cursor(++(st->x), st->size[1] - 1);
+				term_set_cursor(++st->x, st->size[1] - 1);
 			break;
 		case KEY_ARROW_LEFT:
 			/* move cursor left */
@@ -1088,22 +1145,83 @@ key_normal(struct state *st)
 						(size_t)(st->x - 1));
 				term_printf(0, st->size[1] - 1, COLOR_DEFAULT,
 						":%s", st->cmd.s);
-				term_set_cursor(++(st->x), st->size[1] - 1);
+				term_set_cursor(++st->x, st->size[1] - 1);
 			}
 			break;
 		default:
 			break;
 		}
-	} else if (st->ev.ch == 'i') {
-		st->mode = MODE_INSERT;
-		term_print(0, st->size[1] - 1, COLOR_DEFAULT, "INSERT");
-		term_set_cursor(st->x, st->y);
-	} else if (st->ev.ch == ':') {
-		st->editing_cmd = 1;
-		st->storedx = st->x;
-		st->x = 1;
-		term_print(0, st->size[1] - 1, COLOR_DEFAULT, ":");
-		term_set_cursor(st->x, st->size[1] - 1);
+	} else {
+		switch (st->ev.key) {
+		case KEY_ARROW_UP:
+			cursor_up(st);
+			break;
+		case KEY_ARROW_DOWN:
+			cursor_down(st);
+			break;
+		case KEY_ARROW_RIGHT:
+			cursor_right(st);
+			break;
+		case KEY_ARROW_LEFT:
+			cursor_left(st);
+			break;
+		case KEY_ENTER:
+			cursor_startnextrow(st);
+			break;
+		case KEY_BACKSPACE:
+			/* move to previous char */
+			if (st->x == 0 && st->y > 0) {
+				cursor_up(st);
+				cursor_end(st);
+			} else {
+				cursor_left(st);
+			}
+			break;
+		case KEY_CHAR:
+			switch (st->ev.ch) {
+			case 'h':
+				cursor_left(st);
+				break;
+			case 'j':
+				cursor_down(st);
+				break;
+			case 'k':
+				cursor_up(st);
+				break;
+			case 'l':
+				cursor_right(st);
+				break;
+			case '0':
+				cursor_start(st);
+				break;
+			case '$':
+				cursor_end(st);
+				break;
+			case 'i':
+				st->mode = MODE_INSERT;
+				term_print(0, st->size[1] - 1, COLOR_DEFAULT,
+						"INSERT");
+				term_set_cursor(st->x, st->y);
+				break;
+			case 'a':
+				cursor_right(st);
+				st->mode = MODE_INSERT;
+				term_print(0, st->size[1] - 1, COLOR_DEFAULT,
+						"INSERT");
+				term_set_cursor(st->x, st->y);
+				break;
+			case ':':
+				st->editing_cmd = 1;
+				st->storedx = st->x;
+				st->x = 1;
+				term_print(0, st->size[1] - 1, COLOR_DEFAULT,
+						":");
+				term_set_cursor(st->x, st->size[1] - 1);
+				break;
+			}
+		default:
+			break;
+		}
 	}
 }
 
