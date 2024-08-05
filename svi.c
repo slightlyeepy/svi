@@ -27,17 +27,24 @@
 
 /*
  * TODO (from highest to lowest priority):
- * - command mode
- * - writing to file
+ * - movement keys in normal mode
  * - opening files
  * - UTF-8 support
  * - maybe try to handle OOM more gracefully instead of exiting instantly
  */
 
 /*
- * ===========================================================================
+ * ============================================================================
  * configurable macros
  */
+
+/*
+ * ===================
+ * general
+ */
+
+/* mode for newly created files; will be modified by the process's umask(2) */
+#define NEW_FILE_MODE 0666
 
 /*
  * ===================
@@ -56,6 +63,9 @@
 /* how many columns to add to a row's size when it's too small, cant be 0 */
 #define ROW_SIZE_INCREMENT  64
 
+/* how many iovec structures to use when writing to a file */
+#define IOV_SIZE            32
+
 /*
  * ===================
  * terminal
@@ -72,15 +82,9 @@
 #define RESIZE_FALLBACK_MS 500
 
 /*
- * ===========================================================================
+ * ============================================================================
  * compatibility with certain platforms
  */
-
-#include <sys/param.h>
-#if defined(BSD)
-/* BSD needs _BSD_SOURCE for SIGWINCH */
-#define _BSD_SOURCE
-#endif /* BSD */
 
 #if defined(__dietlibc__) && defined(__x86_64__)
 /* needed to work around a bug in dietlibc */
@@ -89,12 +93,13 @@ typedef uint64_t __u64;
 #endif /* __dietlibc__ && __x86_64__ */
 
 /*
- * ===========================================================================
+ * ============================================================================
  * includes
  */
 #define _POSIX_C_SOURCE 200809L
 #include <sys/ioctl.h>
 #include <sys/select.h>
+#include <sys/uio.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -108,7 +113,7 @@ typedef uint64_t __u64;
 #include <unistd.h>
 
 /*
- * ===========================================================================
+ * ============================================================================
  * macros and types
  */
 
@@ -127,6 +132,7 @@ typedef uint64_t __u64;
 #define TERM_CLEAR() write(STDOUT_FILENO, "\033[2J\033[;H", 8)
 
 /* utility */
+#define MIN(x, y) (((x) < (y)) ? (x) : (y))
 #define ROUNDUPTO(x, multiple) (((x + multiple - 1) / multiple) * multiple)
 
 /* enums */
@@ -149,6 +155,11 @@ enum key {
 	KEY_DELETE
 };
 
+enum mode {
+	MODE_NORMAL,
+	MODE_INSERT
+};
+
 /* structs */
 struct term_event {
 	enum event_type type;
@@ -166,8 +177,28 @@ struct buf {
 	size_t size;
 };
 
+struct state {
+	struct buf buf; /* the main buffer */
+	struct str cmd; /* string used to hold commands */
+
+	int size[2]; /* window dimensions */
+	int x, y; /* cursor's current position */
+
+	enum mode mode; /* current mode */
+	int editing_cmd; /* whether a command is being edited */
+	int storedx; /* x position before command editing begun */
+
+	char *name; /* name of file being edited */
+	int name_needs_free; /* whether name should be free()'d */
+	int modified; /* whether the buffer has unwritten changes */
+	int written; /* whether we've written into a file once */
+
+	struct term_event ev; /* current terminal event */
+	int done; /* if this is true, the main loop will finish */
+};
+
 /*
- * ===========================================================================
+ * ============================================================================
  * function declarations
  */
 
@@ -176,15 +207,18 @@ static void *ecalloc(size_t nmemb, size_t size);
 static void *emalloc(size_t size);
 static void *erealloc(void *ptr, size_t size);
 static void *ereallocarray(void *ptr, size_t nmemb, size_t size);
+static char *estrdup(const char *s);
 
 /* errors */
 static void die(const char *fmt, ...);
 
 /* terminal */
 static void readkey(struct term_event *ev);
+static void term_clear_row(int y);
 static void term_event_wait(struct term_event *ev);
 static void term_init(void);
 static void term_print(int x, int y, const char *color, const char *str);
+static void term_printf(int x, int y, const char *color, const char *fmt, ...);
 static void term_set_cursor(int x, int y);
 static void term_shutdown(void);
 static int term_size(int size[2]);
@@ -205,12 +239,22 @@ static void buf_create(struct buf *buf, size_t size);
 static size_t buf_elem_len(struct buf *buf, size_t elem);
 static void buf_free(const struct buf *buf);
 static void buf_resize(struct buf *buf, size_t size);
+static int buf_write(const struct buf *buf, const char *filename,
+		int overwrite);
+
+/* commands */
+static const char *cmdarg(const char *cmd);
+static int cmdchrcmp(const char *cmd, char c);
+static int cmdstrcmp(const char *cmd, const char *s, size_t sl);
+static int exec_cmd(struct state *st);
 
 /* main program loop */
-static void run(void);
+static void key_insert(struct state *st);
+static void key_normal(struct state *st);
+static void run(int argc, char *argv[]);
 
 /*
- * ===========================================================================
+ * ============================================================================
  * global variables
  */
 static const char *argv0 = NULL;
@@ -225,7 +269,7 @@ static sigset_t oldmask;
 #endif /* SIGWINCH */
 
 /*
- * ===========================================================================
+ * ============================================================================
  * memory allocation
  */
 static void *
@@ -266,8 +310,17 @@ ereallocarray(void *ptr, size_t nmemb, size_t size)
 	return erealloc(ptr, nmemb * size);
 }
 
+static char *
+estrdup(const char *s)
+{
+	char *ret = strdup(s);
+	if (!ret)
+		die("strdup: out of memory");
+	return ret;
+}
+
 /*
- * ===========================================================================
+ * ============================================================================
  * errors
  */
 static void
@@ -291,7 +344,7 @@ die(const char *fmt, ...)
 }
 
 /*
- * ===========================================================================
+ * ============================================================================
  * terminal
  */
 static void
@@ -347,6 +400,15 @@ readkey(struct term_event *ev)
 			break;
 		}
 	}
+}
+
+static void
+term_clear_row(int y)
+{
+	if (y < 0)
+		return;
+	printf("\033[%d;H\033[2K", y + 1);
+	fflush(stdout);
 }
 
 static void
@@ -460,6 +522,26 @@ term_print(int x, int y, const char *color, const char *str)
 }
 
 static void
+term_printf(int x, int y, const char *color, const char *fmt, ...)
+{
+	va_list ap;
+
+	if (x < 0 || y < 0)
+		return;
+	printf("\033[%d;%dH\033[2K", y + 1, x + 1);
+	if (color)
+		fputs(color, stdout);
+
+	va_start(ap, fmt);
+	vfprintf(stdout, fmt, ap);
+	va_end(ap);
+
+	if (color)
+		fputs(COLOR_RESET, stdout);
+	fflush(stdout);
+}
+
+static void
 term_set_cursor(int x, int y)
 {
 	if (x < 0 || y < 0)
@@ -554,7 +636,7 @@ winch(int unused)
 #endif /* SIGWINCH */
 
 /*
- * ===========================================================================
+ * ============================================================================
  * strings
  */
 static void
@@ -609,7 +691,7 @@ str_removechar(struct str *str, size_t index)
 	}
 }
 /*
- * ===========================================================================
+ * ============================================================================
  * buffer management
  */
 static void
@@ -694,163 +776,416 @@ buf_resize(struct buf *buf, size_t size)
 	}
 }
 
+static int
+buf_write(const struct buf *buf, const char *filename, int overwrite)
+{
+	struct iovec iov[IOV_SIZE];
+	int fd;
+	char newline = '\n';
+	size_t iovcnt = 0;
+	size_t i = 0;
+
+	if (overwrite)
+		fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC,
+				NEW_FILE_MODE);
+	else
+		fd = open(filename, O_WRONLY | O_CREAT | O_EXCL,
+				NEW_FILE_MODE);
+	if (fd < 0)
+		return -1;
+
+	for (; i < buf->size; ++i) {
+		if (buf->b[i]) {
+			if (iovcnt + 1 >= IOV_SIZE) {
+				if (writev(fd, iov, (int)(MIN(iovcnt + 1,
+							IOV_SIZE))) < 0)
+					return -1;
+				iovcnt = 0;
+			}
+			iov[iovcnt].iov_base = buf->b[i]->s;
+			iov[iovcnt++].iov_len = buf->b[i]->len;
+			iov[iovcnt].iov_base = &newline;
+			iov[iovcnt++].iov_len = 1;
+		}
+	}
+	if (iovcnt && writev(fd, iov, (int)(MIN(iovcnt + 1, IOV_SIZE))) < 0)
+		return -1;
+	return close(fd);
+}
+
 /*
- * ===========================================================================
+ * ============================================================================
+ * commands
+ */
+static const char *
+cmdarg(const char *cmd)
+{
+	/*
+	 * if there's a space and the char afterwards isn't a '\0',
+	 * return a pointer to that char
+	 */
+	const char *p = strchr(cmd, ' ');
+	return (p && *(++p)) ? p : NULL;
+}
+
+static int
+cmdchrcmp(const char *cmd, char c)
+{
+	size_t end = 1;
+
+	/* if the command doesn't start with c, return false */
+	if (cmd[0] != c)
+		return 0;
+
+	/* if there's a bang, count it as part of the command */
+	if (cmd[end] == '!')
+		++end;
+
+	/* if the end of the command isn't a '\0' or a ' ', return false */
+	if (cmd[end] != '\0' && cmd[end] != ' ')
+		return 0;
+	return 1;
+}
+
+static int
+cmdstrcmp(const char *cmd, const char *s, size_t sl)
+{
+	size_t end = sl;
+
+	/* if the command doesn't start with s, return false */
+	if (strncmp(cmd, s, sl))
+		return 0;
+
+	/* if there's a bang, count it as part of the command */
+	if (cmd[end] == '!')
+		++end;
+
+	/* if the end of the command isn't a '\0' or a ' ', return false */
+	if (cmd[end] != '\0' && cmd[end] != ' ')
+		return 0;
+	return -1;
+}
+
+static int
+exec_cmd(struct state *st)
+{
+	if (cmdchrcmp(st->cmd.s, 'q')) {
+		/* :q || :q! */
+		if (st->cmd.s[1] != '!' && st->modified) {
+			term_print(0, st->size[1] - 1, COLOR_RED,
+					"buffer modified");
+			return -1;
+		}
+		st->done = 1;
+	} else if (cmdchrcmp(st->cmd.s, 'w') || cmdstrcmp(st->cmd.s, "wq",
+				2)) {
+		/* :w || :w! || :wq || :wq! */
+		const char *arg = cmdarg(st->cmd.s);
+		const char *name = (arg) ? arg : st->name;
+		int bang = (st->cmd.s[1] == '!' || (st->cmd.s[1] == 'q' &&
+					st->cmd.s[2] == '!'));
+
+		if (arg && !st->name) {
+			st->name = estrdup(arg);
+			st->name_needs_free = 1;
+		}
+		if (name) {
+			if (buf_write(&st->buf, name,
+						bang || st->written) < 0) {
+				if (errno == EEXIST) {
+					term_print(0, st->size[1] - 1,
+							COLOR_RED,
+							"file exists (add ! "
+							"to override)");
+				} else {
+					term_printf(0, st->size[1] - 1,
+							COLOR_RED,
+							"writing to file "
+							"failed: %s",
+							strerror(errno));
+				}
+				return -1;
+			}
+			st->modified = 0;
+			st->written = 1;
+		} else {
+			term_print(0, st->size[1] - 1, COLOR_RED,
+					"no file name specified");
+			return -1;
+		}
+		if (st->cmd.s[1] == 'q')
+			st->done = 1;
+	}
+	return 0;
+}
+
+/*
+ * ============================================================================
  * main program loop
  */
 static void
-run(void)
+key_insert(struct state *st)
 {
-	/* the main buffer; this is where the text is stored. */
-	struct buf buf;
-
-	/* window dimensions and the cursor's current position. */
-	int size[2];
-	int x = 0, y = 0;
-
-	/* current event. */
-	struct term_event ev;
-
-	/* if this is true, the loop will finish. */
-	int done = 0;
-
-	size_t i = 0; /* DEBUG */
-
-	buf_create(&buf, INITIAL_BUFFER_ROWS);
-	if (term_size(size) < 0) {
-		size[0] = FALLBACK_WIDTH;
-		size[1] = FALLBACK_HEIGHT;
+	switch (st->ev.key) {
+	case KEY_ESC:
+		/* go into normal mode */
+		st->mode = MODE_NORMAL;
+		term_clear_row(st->size[1] - 1);
+		term_set_cursor(st->x, st->y);
+		break;
+	case KEY_ARROW_UP:
+		/* move cursor up */
+		if (st->y > 0) {
+			size_t elen = buf_elem_len(&st->buf,
+					(size_t)--(st->y));
+			if ((size_t)st->x > elen)
+				st->x = (int)elen;
+			term_set_cursor(st->x, st->y);
+		}
+		break;
+	case KEY_ARROW_DOWN:
+		/* move cursor down */
+		if (st->y < st->size[1] - 2) {
+			size_t elen = buf_elem_len(&st->buf,
+					(size_t)++(st->y));
+			if ((size_t)st->x > elen)
+				st->x = (int)elen;
+			term_set_cursor(st->x, st->y);
+		}
+		break;
+	case KEY_ARROW_RIGHT:
+		/* move cursor right */
+		if (st->x < st->size[0] - 1 &&
+				(size_t)st->x < buf_elem_len(&st->buf,
+					(size_t)st->y))
+			term_set_cursor(++(st->x), st->y);
+		break;
+	case KEY_ARROW_LEFT:
+		/* move cursor left */
+		if (st->x > 0)
+			term_set_cursor(--(st->x), st->y);
+		break;
+	case KEY_ENTER:
+		/* go to next row */
+		if (st->y < st->size[1] - 2) {
+			st->x = 0;
+			term_set_cursor(st->x, ++(st->y));
+		}
+		break;
+	case KEY_BACKSPACE:
+		/*
+		 * remove char behind cursor, if it's not
+		 * at the beginning of the row and there's
+		 * some text on the current row
+		 */
+		if (st->x > 0 && st->buf.b[st->y] &&
+				st->buf.b[st->y]->len) {
+			st->modified = 1;
+			buf_char_remove(&st->buf, (size_t)st->y,
+					(size_t)(st->x - 1));
+			term_print(0, st->y, COLOR_DEFAULT,
+					st->buf.b[st->y]->s);
+			term_set_cursor(--(st->x), st->y);
+		}
+		break;
+	case KEY_DELETE:
+		/*
+		 * remove char at cursor, if there's some
+		 * text on the current row
+		 */
+		if (st->buf.b[st->y] && st->buf.b[st->y]->len) {
+			st->modified = 1;
+			buf_char_remove(&st->buf, (size_t)st->y,
+					(size_t)st->x);
+			term_print(0, st->y, COLOR_DEFAULT,
+					st->buf.b[st->y]->s);
+			term_set_cursor(st->x, st->y);
+		}
+		break;
+	case KEY_CHAR:
+		/* regular key */
+		if (st->x < st->size[0] - 1) {
+			if ((size_t)st->y >= st->buf.size)
+				buf_resize(&st->buf, (size_t)ROUNDUPTO(st->y,
+					BUF_SIZE_INCREMENT));
+			st->modified = 1;
+			buf_char_insert(&st->buf, (size_t)st->y, st->ev.ch,
+					(size_t)st->x);
+			term_print(0, st->y, COLOR_DEFAULT,
+					st->buf.b[st->y]->s);
+			term_set_cursor(++(st->x), st->y);
+		}
+		break;
+	default:
+		break;
 	}
+}
+
+static void
+key_normal(struct state *st)
+{
+	if (st->editing_cmd) {
+		switch (st->ev.key) {
+		case KEY_ESC:
+			/* stop editing command */
+			st->editing_cmd = 0;
+			st->cmd.s[0] = '\0';
+			st->cmd.len = 0;
+			term_clear_row(st->size[1] - 1);
+			st->x = st->storedx;
+			term_set_cursor(st->x, st->y);
+			break;
+		case KEY_ARROW_RIGHT:
+			/* move cursor right */
+			if (st->x < st->size[0] - 1 && (size_t)(st->x - 1) <
+					st->cmd.len)
+				term_set_cursor(++(st->x), st->size[1] - 1);
+			break;
+		case KEY_ARROW_LEFT:
+			/* move cursor left */
+			if (st->x > 1)
+				term_set_cursor(--(st->x), st->size[1] - 1);
+			break;
+		case KEY_ENTER:
+			/* execute command and stop editing */
+			if (exec_cmd(st) >= 0)
+				term_clear_row(st->size[1] - 1);
+			st->editing_cmd = 0;
+			st->cmd.s[0] = '\0';
+			st->cmd.len = 0;
+			st->x = st->storedx;
+			term_set_cursor(st->x, st->y);
+			break;
+		case KEY_BACKSPACE:
+			/*
+			 * remove char behind cursor, if it's not
+			 * at the beginning of the row and there's
+			 * some text on the current row
+			 */
+			if (st->x > 1 && st->cmd.len) {
+				str_removechar(&st->cmd, (size_t)(st->x - 2));
+				term_printf(0, st->size[1] - 1, COLOR_DEFAULT,
+						":%s", st->cmd.s);
+				term_set_cursor(--(st->x), st->size[1] - 1);
+			}
+			break;
+		case KEY_DELETE:
+			/*
+			 * remove char at cursor, if there's some
+			 * text on the current row
+			 */
+			if (st->cmd.len) {
+				str_removechar(&st->cmd, (size_t)(st->x - 1));
+				term_printf(0, st->size[1] - 1, COLOR_DEFAULT,
+						":%s", st->cmd.s);
+				term_set_cursor(st->x, st->size[1] - 1);
+			}
+			break;
+		case KEY_CHAR:
+			/* regular key */
+			if (st->x > 0 && st->x < st->size[0] - 1) {
+				str_insertchar(&st->cmd, st->ev.ch,
+						(size_t)(st->x - 1));
+				term_printf(0, st->size[1] - 1, COLOR_DEFAULT,
+						":%s", st->cmd.s);
+				term_set_cursor(++(st->x), st->size[1] - 1);
+			}
+			break;
+		default:
+			break;
+		}
+	} else if (st->ev.ch == 'i') {
+		st->mode = MODE_INSERT;
+		term_print(0, st->size[1] - 1, COLOR_DEFAULT, "INSERT");
+		term_set_cursor(st->x, st->y);
+	} else if (st->ev.ch == ':') {
+		st->editing_cmd = 1;
+		st->storedx = st->x;
+		st->x = 1;
+		term_print(0, st->size[1] - 1, COLOR_DEFAULT, ":");
+		term_set_cursor(st->x, st->size[1] - 1);
+	}
+}
+
+static void
+run(int argc, char *argv[])
+{
+	/* program state. */
+	struct state st;
+
+	/* initialize state */
+	buf_create(&st.buf, INITIAL_BUFFER_ROWS);
+
+	st.cmd.s = emalloc(INITIAL_ROW_SIZE);
+	st.cmd.s[0] = '\0';
+	st.cmd.len = 0;
+	st.cmd.size = INITIAL_ROW_SIZE;
+
+	st.x = 0;
+	st.y = 0;
+	st.mode = MODE_NORMAL;
+	st.editing_cmd = 0;
+	st.storedx = 0;
+	st.name = (argc > 1) ? argv[1] : NULL;
+	st.name_needs_free = 0;
+	st.modified = 0;
+	st.written = 0;
+	st.done = 0;
+
+	/* get terminal size */
+	if (term_size(st.size) < 0) {
+		st.size[0] = FALLBACK_WIDTH;
+		st.size[1] = FALLBACK_HEIGHT;
+	}
+	if (st.size[1] < 2)
+		die("terminal height too low");
+
 	term_set_cursor(0, 0);
 
-	while (!done) {
-		term_event_wait(&ev);
+	/* main loop */
+	while (!st.done) {
+		term_event_wait(&st.ev);
 
-		switch (ev.type) {
+		switch (st.ev.type) {
 #if defined(SIGWINCH)
 		case TERM_EVENT_RESIZE:
-			if (term_size(size) < 0) {
-				size[0] = FALLBACK_WIDTH;
-				size[1] = FALLBACK_HEIGHT;
+			if (term_size(st.size) < 0) {
+				st.size[0] = FALLBACK_WIDTH;
+				st.size[1] = FALLBACK_HEIGHT;
 			}
+			if (st.size[1] < 2)
+				die("terminal height too low");
 
 			/*
 			 * check if current cursor position is now
 			 * outside the window, might happen if it
 			 * was resized to be smaller
 			 */
-			if (x >= size[0] - 1)
-				x = size[0] - 1;
-			if (y >= size[1] - 1)
-				y = size[1] - 1;
+			if (st.x >= st.size[0] - 1)
+				st.x = st.size[0] - 1;
+			if (st.y >= st.size[1] - 1)
+				st.y = st.size[1] - 1;
 
 			break;
 #endif /* SIGWINCH */
 		case TERM_EVENT_KEY:
-			switch (ev.key) {
-			case KEY_ESC:
-				/* quit */
-				done = 1;
-				break;
-			case KEY_ARROW_UP:
-				/* move cursor up */
-				if (y > 0) {
-					size_t elen = buf_elem_len(&buf,
-							(size_t)--y);
-					if ((size_t)x > elen)
-						x = (int)elen;
-					term_set_cursor(x, y);
-				}
-				break;
-			case KEY_ARROW_DOWN:
-				/* move cursor down */
-				if (y < size[1] - 1) {
-					size_t elen = buf_elem_len(&buf,
-							(size_t)++y);
-					if ((size_t)x > elen)
-						x = (int)elen;
-					term_set_cursor(x, y);
-				}
-				break;
-			case KEY_ARROW_RIGHT:
-				/* move cursor right */
-				if (x < size[0] - 1 &&
-					(size_t)x < buf_elem_len(&buf,
-						(size_t)y))
-					term_set_cursor(++x, y);
-				break;
-			case KEY_ARROW_LEFT:
-				/* move cursor left */
-				if (x > 0)
-					term_set_cursor(--x, y);
-				break;
-			case KEY_ENTER:
-				/* go to next row */
-				if (y < size[1] - 1) {
-					x = 0;
-					term_set_cursor(x, ++y);
-				}
-				break;
-			case KEY_BACKSPACE:
-				/*
-				 * remove char behind cursor, if it's not
-				 * at the beginning of the row and there's
-				 * some text on the current row
-				 */
-				if (x > 0 && buf.b[y] && buf.b[y]->len) {
-					buf_char_remove(&buf, (size_t)(y),
-							(size_t)(x - 1));
-					term_print(0, y, COLOR_DEFAULT,
-							buf.b[y]->s);
-					term_set_cursor(--x, y);
-				}
-				break;
-			case KEY_DELETE:
-				/*
-				 * remove char at cursor, if there's some
-				 * text on the current row
-				 */
-				if (buf.b[y] && buf.b[y]->len) {
-					buf_char_remove(&buf, (size_t)y,
-							(size_t)x);
-					term_print(0, y, COLOR_DEFAULT,
-							buf.b[y]->s);
-					term_set_cursor(x, y);
-				}
-				break;
-			case KEY_CHAR:
-				/* regular key */
-				if (x < size[0] - 1) {
-					if ((size_t)y >= buf.size)
-						buf_resize(&buf,
-							(size_t)ROUNDUPTO(y,
-							BUF_SIZE_INCREMENT));
-					buf_char_insert(&buf, (size_t)y,
-							ev.ch, (size_t)x);
-					term_print(0, y, COLOR_DEFAULT,
-							buf.b[y]->s);
-					term_set_cursor(++x, y);
-				}
-				break;
+			if (st.mode == MODE_NORMAL) {
+				key_normal(&st);
+			} else if (st.mode == MODE_INSERT) {
+				key_insert(&st);
 			}
+			break;
 		}
 	}
 
-	/* DEBUG */
-	term_shutdown();
-	for (i = 0; i < buf.size; ++i) {
-		if (buf.b[i]) {
-			printf("%lu | %s\n", (unsigned long)i, buf.b[i]->s);
-		} else {
-			printf("%lu ~\n", (unsigned long)i);
-		}
-	}
-	buf_free(&buf);
-	exit(0);
+	if (st.name_needs_free)
+		free(st.name);
+	free(st.cmd.s);
+	buf_free(&st.buf);
 }
 
 /*
- * ===========================================================================
+ * ============================================================================
  * main()
  */
 int
@@ -860,7 +1195,7 @@ main(int argc, char *argv[])
 		argv0 = argv[0];
 
 	term_init();
-	run();
+	run(argc, argv);
 	term_shutdown();
 	return 0;
 }
