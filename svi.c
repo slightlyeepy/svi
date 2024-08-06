@@ -28,7 +28,9 @@
 /*
  * TODO (from highest to lowest priority):
  * - pledge() support for openbsd
+ * - scrolling
  * - opening files
+ * - optimize memory usage on large files
  * - UTF-8 support
  * - maybe try to handle OOM more gracefully instead of exiting instantly
  */
@@ -174,7 +176,7 @@ struct str {
 
 struct buf {
 	struct str **b;
-	size_t size;
+	size_t len, size;
 };
 
 struct state {
@@ -241,6 +243,8 @@ static void buf_free(const struct buf *buf);
 static void buf_resize(struct buf *buf, size_t size);
 static int buf_write(const struct buf *buf, const char *filename,
 		int overwrite);
+static int iov_write(struct iovec *iov, int *iovcnt, size_t iov_size,
+		int writefd, char *str, size_t len);
 
 /* movement */
 static void cursor_up(struct state *st);
@@ -706,6 +710,10 @@ str_removechar(struct str *str, size_t index)
 static void
 buf_char_insert(struct buf *buf, size_t elem, char c, size_t index)
 {
+	if (elem >= buf->size)
+		buf_resize(buf, ROUNDUPTO(elem, BUF_SIZE_INCREMENT));
+	if (elem >= buf->len)
+		buf->len = elem + 1;
 	if (!buf->b[elem]) {
 		buf->b[elem] = emalloc(sizeof(struct str));
 		buf->b[elem]->s = emalloc(INITIAL_ROW_SIZE);
@@ -721,21 +729,15 @@ buf_char_insert(struct buf *buf, size_t elem, char c, size_t index)
 static void
 buf_char_remove(struct buf *buf, size_t elem, size_t index)
 {
-	if (!buf->b[elem]) {
-		buf->b[elem] = emalloc(sizeof(struct str));
-		buf->b[elem]->s = emalloc(INITIAL_ROW_SIZE);
-		buf->b[elem]->s[0] = '\0';
-		buf->b[elem]->len = 0;
-		buf->b[elem]->size = INITIAL_ROW_SIZE;
-	} else {
+	if (elem < buf->size && buf->b[elem])
 		str_removechar(buf->b[elem], index);
-	}
 }
 
 static void
 buf_create(struct buf *buf, size_t size)
 {
 	buf->b = ecalloc(size, sizeof(struct str *));
+	buf->len = 0;
 	buf->size = size;
 }
 
@@ -771,6 +773,11 @@ buf_resize(struct buf *buf, size_t size)
 					free(buf->b[i]);
 				}
 			}
+			if (buf->len > size) {
+				buf->len = size - 1;
+				while (buf->len && !buf->b[buf->len])
+					--buf->len;
+			}
 		}
 
 		buf->b = ereallocarray(buf->b, size, sizeof(struct str *));
@@ -791,7 +798,7 @@ buf_write(const struct buf *buf, const char *filename, int overwrite)
 	struct iovec iov[IOV_SIZE];
 	int fd;
 	char newline = '\n';
-	size_t iovcnt = 0;
+	int iovcnt = 0; /* int since writev() takes an int for iovcnt */
 	size_t i = 0;
 
 	if (overwrite)
@@ -803,23 +810,36 @@ buf_write(const struct buf *buf, const char *filename, int overwrite)
 	if (fd < 0)
 		return -1;
 
-	for (; i < buf->size; ++i) {
+	for (; i < buf->len; ++i) {
 		if (buf->b[i]) {
-			if (iovcnt + 1 >= IOV_SIZE) {
-				if (writev(fd, iov, (int)(MIN(iovcnt + 1,
-							IOV_SIZE))) < 0)
-					return -1;
-				iovcnt = 0;
-			}
-			iov[iovcnt].iov_base = buf->b[i]->s;
-			iov[iovcnt++].iov_len = buf->b[i]->len;
-			iov[iovcnt].iov_base = &newline;
-			iov[iovcnt++].iov_len = 1;
+			if (iov_write(iov, &iovcnt, IOV_SIZE, fd,
+					buf->b[i]->s, buf->b[i]->len) < 0)
+				return -1;
+			if (iov_write(iov, &iovcnt, IOV_SIZE, fd,
+					&newline, 1) < 0)
+				return -1;
+		} else if (iov_write(iov, &iovcnt, IOV_SIZE, fd,
+					&newline, 1) < 0) {
+			return -1;
 		}
 	}
-	if (iovcnt && writev(fd, iov, (int)(MIN(iovcnt + 1, IOV_SIZE))) < 0)
+	if (iovcnt && writev(fd, iov, iovcnt) < 0)
 		return -1;
 	return close(fd);
+}
+
+static int
+iov_write(struct iovec *iov, int *iovcnt, size_t iov_size, int writefd,
+		char *str, size_t len)
+{
+	if ((size_t)*iovcnt >= iov_size) {
+		if (writev(writefd, iov, *iovcnt) < 0)
+			return -1;
+		*iovcnt = 0;
+	}
+	iov[*iovcnt].iov_base = str;
+	iov[(*iovcnt)++].iov_len = len;
+	return 0;
 }
 
 /*
@@ -1062,9 +1082,6 @@ key_insert(struct state *st)
 	case KEY_CHAR:
 		/* regular key */
 		if (st->x < st->size[0] - 1) {
-			if ((size_t)st->y >= st->buf.size)
-				buf_resize(&st->buf, (size_t)ROUNDUPTO(st->y,
-					BUF_SIZE_INCREMENT));
 			st->modified = 1;
 			buf_char_insert(&st->buf, (size_t)st->y, st->ev.ch,
 					(size_t)st->x);
