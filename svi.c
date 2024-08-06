@@ -27,11 +27,13 @@
 
 /*
  * TODO (from highest to lowest priority):
+ * - pressing enter won't actually insert a new line, fix this
  * - scrolling
  * - opening files
- * - optimize memory usage on large files
+ * - optimize certain movements to use less escape sequences
  * - use select() in try_read_char to allow parsing of cursor key sequences
  *   if there's a delay between the characters
+ * - optimize memory usage on large files
  * - UTF-8 support
  * - maybe try to handle OOM more gracefully instead of exiting instantly
  */
@@ -51,6 +53,21 @@
 
 /* mode for newly created files; will be modified by the process's umask(2) */
 #define NEW_FILE_MODE 0666
+
+/*
+ * ===================
+ * terminal
+ */
+
+/* if getting the terminal's size fails, the following size is used instead */
+#define FALLBACK_WIDTH  80
+#define FALLBACK_HEIGHT 24
+
+/*
+ * how long to wait for the terminal's response when getting the size with
+ * the fallback method. cant be higher than 999
+ */
+#define RESIZE_FALLBACK_MS 500
 
 /*
  * ===================
@@ -74,18 +91,20 @@
 
 /*
  * ===================
- * terminal
+ * commands
  */
-
-/* if getting the terminal's size fails, the following size is used instead */
-#define FALLBACK_WIDTH  80
-#define FALLBACK_HEIGHT 24
 
 /*
- * how long to wait for the terminal's response when getting the size with
- * the fallback method. cant be higher than 999
+ * how many characters to initially allocate for the command
+ * buffer, cant be 0
  */
-#define RESIZE_FALLBACK_MS 500
+#define INITIAL_CMD_SIZE    16
+
+/*
+ * how many characters to add to the command buffer's size when it's too
+ * small, cant be 0
+ */
+#define CMD_SIZE_INCREMENT  16
 
 /*
  * ============================================================================
@@ -144,7 +163,6 @@ typedef uint64_t __u64;
 #define TERM_CLEAR() write(STDOUT_FILENO, "\033[2J\033[;H", 8)
 
 /* utility */
-#define MIN(x, y) (((x) < (y)) ? (x) : (y))
 #define ROUNDUPTO(x, multiple) (((x + multiple - 1) / multiple) * multiple)
 
 /* enums */
@@ -169,7 +187,8 @@ enum key {
 
 enum mode {
 	MODE_NORMAL,
-	MODE_INSERT
+	MODE_INSERT,
+	MODE_COMMAND_LINE
 };
 
 /* structs */
@@ -197,8 +216,7 @@ struct state {
 	int x, y; /* cursor's current position */
 
 	enum mode mode; /* current mode */
-	int editing_cmd; /* whether a command is being edited */
-	int storedx; /* x position before command editing begun */
+	int storedx; /* x position before entering command-line mode */
 
 	char *name; /* name of file being edited */
 	int name_needs_free; /* whether name should be free()'d */
@@ -240,7 +258,8 @@ static void winch(int unused);
 #endif /* SIGWINCH */
 
 /* strings */
-static void str_insertchar(struct str *str, char c, size_t index);
+static void str_insertchar(struct str *str, char c, size_t index,
+		size_t size_increment);
 static void str_removechar(struct str *str, size_t index);
 
 /* buffer management */
@@ -272,6 +291,7 @@ static int cmdstrcmp(const char *cmd, const char *s, size_t sl);
 static int exec_cmd(struct state *st);
 
 /* main program loop */
+static void key_command_line(struct state *st);
 static void key_insert(struct state *st);
 static void key_normal(struct state *st);
 static void run(int argc, char *argv[]);
@@ -373,15 +393,23 @@ die(const char *fmt, ...)
 static void
 readkey(struct term_event *ev)
 {
+	/* read a key from stdin and write the data into a term_event. */
 	char c;
 	for (;;) {
 		read(STDIN_FILENO, &c, 1);
 		switch (c) {
 		case '\033':
+			/*
+			 * <ESC>, might be the start of a multi-character
+			 * key sequence
+			 */
 			if (try_read_chr(&c)) {
+				/* atleast two characters long */
 				if (c == '[' && try_read_chr(&c)) {
+					/* <ESC>[<something> */
 					switch (c) {
 					case '3':
+						/* <ESC>[3~ = delete */
 						if (try_read_chr(&c) &&
 								c == '~') {
 							ev->key = KEY_DELETE;
@@ -389,32 +417,39 @@ readkey(struct term_event *ev)
 						}
 						break;
 					case 'A':
+						/* <ESC>[A = up arrow */
 						ev->key = KEY_ARROW_UP;
 						return;
 					case 'B':
+						/* <ESC>[B = down arrow */
 						ev->key = KEY_ARROW_DOWN;
 						return;
 					case 'C':
+						/* <ESC>[C = right arrow */
 						ev->key = KEY_ARROW_RIGHT;
 						return;
 					case 'D':
+						/* <ESC>[D = left arrow */
 						ev->key = KEY_ARROW_LEFT;
 						return;
 					}
 				}
 			} else {
+				/* it's just <ESC> */
 				ev->key = KEY_ESC;
 				return;
 			}
 			break;
 		case '\r':
+			/* carriage return = enter */
 			ev->key = KEY_ENTER;
 			return;
 		case 127:
+			/* <DEL> = backspace */
 			ev->key = KEY_BACKSPACE;
 			return;
 		default:
-			/* currently only ASCII is supported */
+			/* another key, currently only ASCII is supported */
 			if (c < 0x7f) {
 				ev->key = KEY_CHAR;
 				ev->ch = c;
@@ -428,6 +463,7 @@ readkey(struct term_event *ev)
 static void
 term_clear_row(int y)
 {
+	/* clear the row at y-coordinate y. */
 	if (y < 0)
 		return;
 	printf("\033[%d;H\033[2K", y + 1);
@@ -437,6 +473,7 @@ term_clear_row(int y)
 static void
 term_event_wait(struct term_event *ev)
 {
+	/* wait for a terminal event (either resize or keypress). */
 	fd_set rfds;
 	int rv;
 
@@ -481,6 +518,7 @@ term_event_wait(struct term_event *ev)
 static void
 term_init(void)
 {
+	/* initialize the terminal for use by the other term_* functions. */
 #if defined(SIGWINCH)
 	struct sigaction sa;
 	sigset_t mask;
@@ -533,6 +571,10 @@ term_init(void)
 static void
 term_print(int x, int y, const char *color, const char *str)
 {
+	/*
+	 * clear the row at y-coordinate y and print the string str at
+	 * the location (x, y).
+	 */
 	if (x < 0 || y < 0)
 		return;
 	printf("\033[%d;%dH\033[2K", y + 1, x + 1);
@@ -547,6 +589,7 @@ term_print(int x, int y, const char *color, const char *str)
 static void
 term_printf(int x, int y, const char *color, const char *fmt, ...)
 {
+	/* same as term_print, but printf. */
 	va_list ap;
 
 	if (x < 0 || y < 0)
@@ -567,6 +610,7 @@ term_printf(int x, int y, const char *color, const char *fmt, ...)
 static void
 term_set_cursor(int x, int y)
 {
+	/* set the cursor to the location (x, y). */
 	if (x < 0 || y < 0)
 		return;
 	printf("\033[%d;%dH", y + 1, x + 1);
@@ -590,6 +634,13 @@ term_shutdown(void)
 static int
 term_size(int size[2])
 {
+	/*
+	 * get the terminal's size and store it in size:
+	 * size[0] = width
+	 * size[1] = height
+	 *
+	 * if getting the size fails, return -1; otherwise, return 0.
+	 */
 	fd_set rfds;
 	struct timeval timeout;
 
@@ -640,6 +691,13 @@ term_size(int size[2])
 static int
 try_read_chr(char *c)
 {
+	/*
+	 * try to read a character from stdin.
+	 * if there's no data available on stdin, return 0.
+	 * if there's data available, store the character in *c and return 1.
+	 *
+	 * requires stdin to be in non-blocking mode.
+	 */
 	if (read(STDIN_FILENO, c, 1) < 0) {
 		if (errno == EAGAIN)
 			return 0;
@@ -663,13 +721,19 @@ winch(int unused)
  * strings
  */
 static void
-str_insertchar(struct str *str, char c, size_t index)
+str_insertchar(struct str *str, char c, size_t index, size_t size_increment)
 {
+	/*
+	 * insert the character c into the string str at the index index.
+	 * if the string is too small to hold the extra character,
+	 * increase its size by size_increment.
+	 */
 	if (str->len + 1 >= str->size) {
 		/* if the string is too small, increase its size */
-		str->size += ROW_SIZE_INCREMENT;
+		str->size += size_increment;
 		str->s = erealloc(str->s, str->size);
 	}
+
 	if (index > str->len)
 		index = str->len;
 
@@ -694,6 +758,7 @@ str_insertchar(struct str *str, char c, size_t index)
 static void
 str_removechar(struct str *str, size_t index)
 {
+	/* remove the character located at index index from the string str. */
 	if (str->len == 0)
 		return;
 
@@ -713,6 +778,7 @@ str_removechar(struct str *str, size_t index)
 		--str->len;
 	}
 }
+
 /*
  * ============================================================================
  * buffer management
@@ -720,6 +786,10 @@ str_removechar(struct str *str, size_t index)
 static void
 buf_char_insert(struct buf *buf, size_t elem, char c, size_t index)
 {
+	/*
+	 * insert a character into a specific element of a buffer,
+	 * creating it if it doesn't exist.
+	 */
 	if (elem >= buf->size)
 		buf_resize(buf, ROUNDUPTO(elem, BUF_SIZE_INCREMENT));
 	if (elem >= buf->len)
@@ -732,13 +802,14 @@ buf_char_insert(struct buf *buf, size_t elem, char c, size_t index)
 		buf->b[elem]->len = 1;
 		buf->b[elem]->size = INITIAL_ROW_SIZE;
 	} else {
-		str_insertchar(buf->b[elem], c, index);
+		str_insertchar(buf->b[elem], c, index, ROW_SIZE_INCREMENT);
 	}
 }
 
 static void
 buf_char_remove(struct buf *buf, size_t elem, size_t index)
 {
+	/* remove a character from a specific element of a buffer. */
 	if (elem < buf->size && buf->b[elem])
 		str_removechar(buf->b[elem], index);
 }
@@ -746,6 +817,7 @@ buf_char_remove(struct buf *buf, size_t elem, size_t index)
 static void
 buf_create(struct buf *buf, size_t size)
 {
+	/* create a new buffer. */
 	buf->b = ecalloc(size, sizeof(struct str *));
 	buf->len = 0;
 	buf->size = size;
@@ -754,14 +826,19 @@ buf_create(struct buf *buf, size_t size)
 static size_t
 buf_elem_len(struct buf *buf, size_t elem)
 {
+	/*
+	 * returns the length of an element of a buffer, or 0 if it
+	 * doesn't exist.
+	 */
 	return (buf->b[elem]) ? buf->b[elem]->len : 0;
 }
 
 static void
 buf_free(const struct buf *buf)
 {
+	/* free a buffer and all of its elements. */
 	size_t i = 0;
-	for (; i < buf->size; ++i) {
+	for (; i < buf->len; ++i) {
 		if (buf->b[i]) {
 			free(buf->b[i]->s);
 			free(buf->b[i]);
@@ -773,6 +850,7 @@ buf_free(const struct buf *buf)
 static void
 buf_resize(struct buf *buf, size_t size)
 {
+	/* resize a buffer. */
 	if (size != buf->size) {
 		size_t oldsize = buf->size;
 		if (size < oldsize) {
@@ -805,6 +883,7 @@ buf_resize(struct buf *buf, size_t size)
 static int
 buf_write(const struct buf *buf, const char *filename, int overwrite)
 {
+	/* write the contents of a buffer to a file. */
 	struct iovec iov[IOV_SIZE];
 	int fd;
 	char newline = '\n';
@@ -842,6 +921,10 @@ static int
 iov_write(struct iovec *iov, int *iovcnt, size_t iov_size, int writefd,
 		char *str, size_t len)
 {
+	/*
+	 * add an entry to an array of iovec structures, or flush the
+	 * data to a file if there's no space remaining in the array.
+	 */
 	if ((size_t)*iovcnt >= iov_size) {
 		if (writev(writefd, iov, *iovcnt) < 0)
 			return -1;
@@ -924,6 +1007,15 @@ cursor_startnextrow(struct state *st)
 	}
 }
 
+static void
+cursor_endpreviousrow(struct state *st)
+{
+	if (st->y > 0) {
+		st->x = (int)buf_elem_len(&st->buf, (size_t)--(st->y));
+		term_set_cursor(st->x, st->y);
+	}
+}
+
 /*
  * ============================================================================
  * commands
@@ -931,6 +1023,11 @@ cursor_startnextrow(struct state *st)
 static const char *
 cmdarg(const char *cmd)
 {
+	/*
+	 * get the argument portion of a command.
+	 * returns NULL if there isn't one.
+	 */
+
 	/*
 	 * if there's a space and the char afterwards isn't a '\0',
 	 * return a pointer to that char
@@ -942,6 +1039,13 @@ cmdarg(const char *cmd)
 static int
 cmdchrcmp(const char *cmd, char c)
 {
+	/*
+	 * check if a command (not counting the argument portion) equals to
+	 * a character with an optional bang at the end.
+	 *
+	 * for example, cmdchrcmp(cmd, 'q') will return true for "q", "q!",
+	 * "q " followed by anything, or "q! " followed by anything.
+	 */
 	size_t end = 1;
 
 	/* if the command doesn't start with c, return false */
@@ -961,6 +1065,7 @@ cmdchrcmp(const char *cmd, char c)
 static int
 cmdstrcmp(const char *cmd, const char *s, size_t sl)
 {
+	/* same as cmdchrcmp(), but compare against a string. */
 	size_t end = sl;
 
 	/* if the command doesn't start with s, return false */
@@ -980,6 +1085,7 @@ cmdstrcmp(const char *cmd, const char *s, size_t sl)
 static int
 exec_cmd(struct state *st)
 {
+	/* execute a command. returns 0 on success and -1 on error. */
 	if (cmdchrcmp(st->cmd.s, 'q')) {
 		/* :q || :q! */
 		if (st->cmd.s[1] != '!' && st->modified) {
@@ -1035,8 +1141,85 @@ exec_cmd(struct state *st)
  * main program loop
  */
 static void
+key_command_line(struct state *st)
+{
+	/* handle a key event in command-line mode. */
+	switch (st->ev.key) {
+	case KEY_ESC:
+		/* discard command and return to normal mode */
+		st->mode = MODE_NORMAL;
+		st->cmd.s[0] = '\0';
+		st->cmd.len = 0;
+		term_clear_row(st->size[1] - 1);
+		st->x = st->storedx;
+		term_set_cursor(st->x, st->y);
+		break;
+	case KEY_ARROW_RIGHT:
+		/* move cursor right */
+		if (st->x < st->size[0] - 1 && (size_t)(st->x - 1) <
+				st->cmd.len)
+			term_set_cursor(++st->x, st->size[1] - 1);
+		break;
+	case KEY_ARROW_LEFT:
+		/* move cursor left */
+		if (st->x > 1)
+			term_set_cursor(--(st->x), st->size[1] - 1);
+		break;
+	case KEY_ENTER:
+		/* execute command and return to normal mode */
+		if (exec_cmd(st) >= 0)
+			term_clear_row(st->size[1] - 1);
+		st->mode = MODE_NORMAL;
+		st->cmd.s[0] = '\0';
+		st->cmd.len = 0;
+		st->x = st->storedx;
+		term_set_cursor(st->x, st->y);
+		break;
+	case KEY_BACKSPACE:
+		/*
+		 * remove char behind cursor, if it's not
+		 * at the beginning of the row and there's
+		 * some text on the current row
+		 */
+		if (st->x > 1 && st->cmd.len) {
+			str_removechar(&st->cmd, (size_t)(st->x - 2));
+			term_printf(0, st->size[1] - 1, COLOR_DEFAULT,
+					":%s", st->cmd.s);
+			term_set_cursor(--(st->x), st->size[1] - 1);
+		}
+		break;
+	case KEY_DELETE:
+		/*
+		 * remove char at cursor, if there's some
+		 * text on the current row
+		 */
+		if (st->cmd.len) {
+			str_removechar(&st->cmd, (size_t)(st->x - 1));
+			term_printf(0, st->size[1] - 1, COLOR_DEFAULT,
+					":%s", st->cmd.s);
+			term_set_cursor(st->x, st->size[1] - 1);
+		}
+		break;
+	case KEY_CHAR:
+		/* regular key */
+		if (st->x > 0 && st->x < st->size[0] - 1) {
+			str_insertchar(&st->cmd, st->ev.ch,
+					(size_t)(st->x - 1),
+					CMD_SIZE_INCREMENT);
+			term_printf(0, st->size[1] - 1, COLOR_DEFAULT,
+					":%s", st->cmd.s);
+			term_set_cursor(++st->x, st->size[1] - 1);
+		}
+		break;
+	default:
+		break;
+	}
+}
+
+static void
 key_insert(struct state *st)
 {
+	/* handle a key event in insert mode. */
 	switch (st->ev.key) {
 	case KEY_ESC:
 		/* go into normal mode */
@@ -1108,160 +1291,87 @@ key_insert(struct state *st)
 static void
 key_normal(struct state *st)
 {
-	if (st->editing_cmd) {
-		switch (st->ev.key) {
-		case KEY_ESC:
-			/* stop editing command */
-			st->editing_cmd = 0;
-			st->cmd.s[0] = '\0';
-			st->cmd.len = 0;
-			term_clear_row(st->size[1] - 1);
-			st->x = st->storedx;
-			term_set_cursor(st->x, st->y);
-			break;
-		case KEY_ARROW_RIGHT:
-			/* move cursor right */
-			if (st->x < st->size[0] - 1 && (size_t)(st->x - 1) <
-					st->cmd.len)
-				term_set_cursor(++st->x, st->size[1] - 1);
-			break;
-		case KEY_ARROW_LEFT:
-			/* move cursor left */
-			if (st->x > 1)
-				term_set_cursor(--(st->x), st->size[1] - 1);
-			break;
-		case KEY_ENTER:
-			/* execute command and stop editing */
-			if (exec_cmd(st) >= 0)
-				term_clear_row(st->size[1] - 1);
-			st->editing_cmd = 0;
-			st->cmd.s[0] = '\0';
-			st->cmd.len = 0;
-			st->x = st->storedx;
-			term_set_cursor(st->x, st->y);
-			break;
-		case KEY_BACKSPACE:
-			/*
-			 * remove char behind cursor, if it's not
-			 * at the beginning of the row and there's
-			 * some text on the current row
-			 */
-			if (st->x > 1 && st->cmd.len) {
-				str_removechar(&st->cmd, (size_t)(st->x - 2));
-				term_printf(0, st->size[1] - 1, COLOR_DEFAULT,
-						":%s", st->cmd.s);
-				term_set_cursor(--(st->x), st->size[1] - 1);
-			}
-			break;
-		case KEY_DELETE:
-			/*
-			 * remove char at cursor, if there's some
-			 * text on the current row
-			 */
-			if (st->cmd.len) {
-				str_removechar(&st->cmd, (size_t)(st->x - 1));
-				term_printf(0, st->size[1] - 1, COLOR_DEFAULT,
-						":%s", st->cmd.s);
-				term_set_cursor(st->x, st->size[1] - 1);
-			}
-			break;
-		case KEY_CHAR:
-			/* regular key */
-			if (st->x > 0 && st->x < st->size[0] - 1) {
-				str_insertchar(&st->cmd, st->ev.ch,
-						(size_t)(st->x - 1));
-				term_printf(0, st->size[1] - 1, COLOR_DEFAULT,
-						":%s", st->cmd.s);
-				term_set_cursor(++st->x, st->size[1] - 1);
-			}
-			break;
-		default:
-			break;
-		}
-	} else {
-		switch (st->ev.key) {
-		case KEY_ARROW_UP:
-			cursor_up(st);
-			break;
-		case KEY_ARROW_DOWN:
-			cursor_down(st);
-			break;
-		case KEY_ARROW_RIGHT:
-			cursor_right(st);
-			break;
-		case KEY_ARROW_LEFT:
+	/* handle a key event in normal mode. */
+	switch (st->ev.key) {
+	case KEY_ARROW_UP:
+		cursor_up(st);
+		break;
+	case KEY_ARROW_DOWN:
+		cursor_down(st);
+		break;
+	case KEY_ARROW_RIGHT:
+		cursor_right(st);
+		break;
+	case KEY_ARROW_LEFT:
+		cursor_left(st);
+		break;
+	case KEY_ENTER:
+		cursor_startnextrow(st);
+		break;
+	case KEY_BACKSPACE:
+		/* move to previous char */
+		if (st->x == 0 && st->y > 0)
+			cursor_endpreviousrow(st);
+		else
+			cursor_left(st);
+		break;
+	case KEY_CHAR:
+		switch (st->ev.ch) {
+		case 'h':
 			cursor_left(st);
 			break;
-		case KEY_ENTER:
-			cursor_startnextrow(st);
+		case 'j':
+			cursor_down(st);
 			break;
-		case KEY_BACKSPACE:
-			/* move to previous char */
-			if (st->x == 0 && st->y > 0) {
-				cursor_up(st);
-				cursor_end(st);
-			} else {
-				cursor_left(st);
-			}
+		case 'k':
+			cursor_up(st);
 			break;
-		case KEY_CHAR:
-			switch (st->ev.ch) {
-			case 'h':
-				cursor_left(st);
-				break;
-			case 'j':
-				cursor_down(st);
-				break;
-			case 'k':
-				cursor_up(st);
-				break;
-			case 'l':
-				cursor_right(st);
-				break;
-			case '0':
-				cursor_start(st);
-				break;
-			case '$':
-				cursor_end(st);
-				break;
-			case 'i':
-				st->mode = MODE_INSERT;
-				term_print(0, st->size[1] - 1, COLOR_DEFAULT,
-						"INSERT");
-				term_set_cursor(st->x, st->y);
-				break;
-			case 'a':
-				cursor_right(st);
-				st->mode = MODE_INSERT;
-				term_print(0, st->size[1] - 1, COLOR_DEFAULT,
-						"INSERT");
-				term_set_cursor(st->x, st->y);
-				break;
-			case ':':
-				st->editing_cmd = 1;
-				st->storedx = st->x;
-				st->x = 1;
-				term_print(0, st->size[1] - 1, COLOR_DEFAULT,
-						":");
-				term_set_cursor(st->x, st->size[1] - 1);
-				break;
-			}
-		default:
+		case 'l':
+			cursor_right(st);
+			break;
+		case '0':
+			cursor_start(st);
+			break;
+		case '$':
+			cursor_end(st);
+			break;
+		case 'i':
+			st->mode = MODE_INSERT;
+			term_print(0, st->size[1] - 1, COLOR_DEFAULT,
+					"INSERT");
+			term_set_cursor(st->x, st->y);
+			break;
+		case 'a':
+			cursor_right(st);
+			st->mode = MODE_INSERT;
+			term_print(0, st->size[1] - 1, COLOR_DEFAULT,
+					"INSERT");
+			term_set_cursor(st->x, st->y);
+			break;
+		case ':':
+			st->mode = MODE_COMMAND_LINE;
+			st->storedx = st->x;
+			st->x = 1;
+			term_print(0, st->size[1] - 1, COLOR_DEFAULT,
+					":");
+			term_set_cursor(st->x, st->size[1] - 1);
 			break;
 		}
+	default:
+		break;
 	}
 }
 
 static void
 run(int argc, char *argv[])
 {
-	/* program state. */
+	/* main program loop. */
 	struct state st;
 
 	/* initialize state */
 	buf_create(&st.buf, INITIAL_BUFFER_ROWS);
 
-	st.cmd.s = emalloc(INITIAL_ROW_SIZE);
+	st.cmd.s = emalloc(INITIAL_CMD_SIZE);
 	st.cmd.s[0] = '\0';
 	st.cmd.len = 0;
 	st.cmd.size = INITIAL_ROW_SIZE;
@@ -1269,7 +1379,6 @@ run(int argc, char *argv[])
 	st.x = 0;
 	st.y = 0;
 	st.mode = MODE_NORMAL;
-	st.editing_cmd = 0;
 	st.storedx = 0;
 	st.name = (argc > 1) ? argv[1] : NULL;
 	st.name_needs_free = 0;
@@ -1314,11 +1423,12 @@ run(int argc, char *argv[])
 			break;
 #endif /* SIGWINCH */
 		case TERM_EVENT_KEY:
-			if (st.mode == MODE_NORMAL) {
-				key_normal(&st);
-			} else if (st.mode == MODE_INSERT) {
+			if (st.mode == MODE_COMMAND_LINE)
+				key_command_line(&st);
+			else if (st.mode == MODE_INSERT)
 				key_insert(&st);
-			}
+			else if (st.mode == MODE_NORMAL)
+				key_normal(&st);
 			break;
 		}
 	}
