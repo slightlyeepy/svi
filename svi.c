@@ -27,10 +27,11 @@
 
 /*
  * TODO (from highest to lowest priority):
- * - pledge() support for openbsd
  * - scrolling
  * - opening files
  * - optimize memory usage on large files
+ * - use select() in try_read_char to allow parsing of cursor key sequences
+ *   if there's a delay between the characters
  * - UTF-8 support
  * - maybe try to handle OOM more gracefully instead of exiting instantly
  */
@@ -44,6 +45,9 @@
  * ===================
  * general
  */
+
+/* enable usage of OpenBSD's pledge(2). 0 = false, 1 = true */
+#define ENABLE_PLEDGE 0
 
 /* mode for newly created files; will be modified by the process's umask(2) */
 #define NEW_FILE_MODE 0666
@@ -87,6 +91,12 @@
  * ============================================================================
  * compatibility with certain platforms
  */
+
+#if defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || \
+	defined(__bsdi__) || defined(__DragonFly__) || defined(_SYSTYPE_BSD)
+/* BSD needs _BSD_SOURCE for SIGWINCH and (on OpenBSD) pledge() */
+#define _BSD_SOURCE
+#endif /* BSD */
 
 #if defined(__dietlibc__) && defined(__x86_64__)
 /* needed to work around a bug in dietlibc */
@@ -1328,6 +1338,11 @@ main(int argc, char *argv[])
 {
 	if (argc)
 		argv0 = argv[0];
+
+#if ENABLE_PLEDGE
+        if (pledge("stdio rpath wpath cpath tty", NULL) < 0)
+		die("pledge:");
+#endif /* ENABLE_PLEDGE */
 
 	term_init();
 	run(argc, argv);
