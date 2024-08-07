@@ -49,7 +49,7 @@
  */
 
 /*
- * enable usage of non-POSIX but very common features (sys/ioctl.h,
+ * enable usage of non-POSIX/XSI but very common features (sys/ioctl.h,
  * sys/param.h, ioctl, TIOCGWINSZ, and SIGWINCH).
  * 0 = false, 1 = true
  */
@@ -72,7 +72,7 @@
 
 /*
  * how long to wait for the terminal's response when getting the size with
- * the fallback method. cant be higher than 999
+ * the fallback method. can't be higher than 999.
  */
 #define RESIZE_FALLBACK_MS 500
 
@@ -93,8 +93,16 @@
 /* how many columns to add to a row's size when it's too small, cant be 0 */
 #define ROW_SIZE_INCREMENT  64
 
-/* how many iovec structures to use when writing to a file */
-#define IOV_SIZE            32
+/*
+ * how many iovec structures to use when writing to a file.
+ * can't be higher than IOV_MAX (guaranteed to be at least 16, but typically
+ * a lot higher)
+ */
+#if ENABLE_NONPOSIX
+#define IOV_SIZE            64
+#else
+#define IOV_SIZE            16
+#endif /* ENABLE_NONPOSIX */
 
 /*
  * ===================
@@ -138,7 +146,7 @@ typedef uint64_t __u64;
  * ============================================================================
  * includes
  */
-#define _POSIX_C_SOURCE 200809L
+#define _XOPEN_SOURCE 700
 #if ENABLE_NONPOSIX
 #include <sys/ioctl.h>
 #endif /* ENABLE_NONPOSIX */
