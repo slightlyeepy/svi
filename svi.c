@@ -48,11 +48,18 @@
  * general
  */
 
+/*
+ * enable usage of non-POSIX but very common features (sys/ioctl.h,
+ * sys/param.h, ioctl, TIOCGWINSZ, and SIGWINCH).
+ * 0 = false, 1 = true
+ */
+#define ENABLE_NONPOSIX 1
+
 /* enable usage of OpenBSD's pledge(2). 0 = false, 1 = true */
-#define ENABLE_PLEDGE 0
+#define ENABLE_PLEDGE   0
 
 /* mode for newly created files; will be modified by the process's umask(2) */
-#define NEW_FILE_MODE 0666
+#define NEW_FILE_MODE   0666
 
 /*
  * ===================
@@ -111,24 +118,30 @@
  * compatibility with certain platforms
  */
 
-#if defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || \
-	defined(__bsdi__) || defined(__DragonFly__) || defined(_SYSTYPE_BSD)
+#if ENABLE_NONPOSIX
+#include <sys/param.h>
+
+#if defined(BSD)
 /* BSD needs _BSD_SOURCE for SIGWINCH and (on OpenBSD) pledge() */
 #define _BSD_SOURCE
-#endif /* BSD */
+#endif /* defined(BSD) */
+
+#endif /* ENABLE_NONPOSIX */
 
 #if defined(__dietlibc__) && defined(__x86_64__)
 /* needed to work around a bug in dietlibc */
 #include <stdint.h>
 typedef uint64_t __u64;
-#endif /* __dietlibc__ && __x86_64__ */
+#endif /* defined(__dietlibc__) && defined(__x86_64__) */
 
 /*
  * ============================================================================
  * includes
  */
 #define _POSIX_C_SOURCE 200809L
+#if ENABLE_NONPOSIX
 #include <sys/ioctl.h>
+#endif /* ENABLE_NONPOSIX */
 #include <sys/select.h>
 #include <sys/uio.h>
 
@@ -160,16 +173,14 @@ typedef uint64_t __u64;
 #define COLOR_CYAN    "\033[36m"
 #define COLOR_WHITE   "\033[37m"
 
-#define TERM_CLEAR() write(STDOUT_FILENO, "\033[2J\033[;H", 8)
-
 /* utility */
 #define ROUNDUPTO(x, multiple) (((x + multiple - 1) / multiple) * multiple)
 
 /* enums */
 enum event_type {
-#if defined(SIGWINCH)
+#if ENABLE_NONPOSIX && defined(SIGWINCH)
 	TERM_EVENT_RESIZE,
-#endif /* SIGWINCH */
+#endif /* ENABLE_NONPOSIX && defined(SIGWINCH) */
 	TERM_EVENT_KEY
 };
 
@@ -212,7 +223,7 @@ struct state {
 	struct buf buf; /* the main buffer */
 	struct str cmd; /* string used to hold commands */
 
-	int size[2]; /* window dimensions */
+	int w, h; /* window dimensions */
 	int x, y; /* cursor's current position */
 
 	enum mode mode; /* current mode */
@@ -251,11 +262,11 @@ static void term_print(int x, int y, const char *color, const char *str);
 static void term_printf(int x, int y, const char *color, const char *fmt, ...);
 static void term_set_cursor(int x, int y);
 static void term_shutdown(void);
-static int term_size(int size[2]);
+static int term_size(int *w, int *h);
 static int try_read_chr(char *c);
-#if defined(SIGWINCH)
+#if ENABLE_NONPOSIX && defined(SIGWINCH)
 static void winch(int unused);
-#endif /* SIGWINCH */
+#endif /* ENABLE_NONPOSIX && defined(SIGWINCH) */
 
 /* strings */
 static void str_insertchar(struct str *str, char c, size_t index,
@@ -306,10 +317,10 @@ static const char *argv0 = NULL;
 static int term_initialized = 0;
 static struct termios tio, oldtio;
 static int old_stdin_flags;
-#if defined(SIGWINCH)
+#if ENABLE_NONPOSIX && defined(SIGWINCH)
 static volatile sig_atomic_t win_resized = 0;
 static sigset_t oldmask;
-#endif /* SIGWINCH */
+#endif /* ENABLE_NONPOSIX && defined(SIGWINCH) */
 
 /*
  * ============================================================================
@@ -479,7 +490,7 @@ term_event_wait(struct term_event *ev)
 
 	FD_ZERO(&rfds);
 	FD_SET(STDIN_FILENO, &rfds);
-#if defined(SIGWINCH)
+#if ENABLE_NONPOSIX && defined(SIGWINCH)
 	/* do pselect() to wait for SIGWINCH or data on stdin */
 	rv = pselect(1, &rfds, NULL, NULL, NULL, &oldmask);
 	if (rv < 0) {
@@ -487,7 +498,6 @@ term_event_wait(struct term_event *ev)
 			/* got SIGWINCH */
 			win_resized = 0;
 			ev->type = TERM_EVENT_RESIZE;
-			return;
 		} else {
 			die("pselect:");
 		}
@@ -512,17 +522,17 @@ term_event_wait(struct term_event *ev)
 		/* ... can this even happen? */
 		die("select: timeout");
 	}
-#endif /* SIGWINCH */
+#endif /* ENABLE_NONPOSIX && defined(SIGWINCH) */
 }
 
 static void
 term_init(void)
 {
 	/* initialize the terminal for use by the other term_* functions. */
-#if defined(SIGWINCH)
+#if ENABLE_NONPOSIX && defined(SIGWINCH)
 	struct sigaction sa;
 	sigset_t mask;
-#endif /* SIGWINCH */
+#endif /* ENABLE_NONPOSIX && defined(SIGWINCH) */
 
 	if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO))
 		die("stdin and stdout must be a terminal");
@@ -549,7 +559,7 @@ term_init(void)
 	if (fcntl(STDIN_FILENO, F_SETFL, old_stdin_flags | O_NONBLOCK) < 0)
 		die("fcntl:");
 
-#if defined(SIGWINCH)
+#if ENABLE_NONPOSIX && defined(SIGWINCH)
 	/* set handler for SIGWINCH */
 	sigemptyset(&sa.sa_mask);
 	sa.sa_flags = 0;
@@ -562,9 +572,10 @@ term_init(void)
 	sigaddset(&mask, SIGWINCH);
 	if (sigprocmask(SIG_BLOCK, &mask, &oldmask) < 0)
 		die("sigprocmask:");
-#endif /* SIGWINCH */
+#endif /* ENABLE_NONPOSIX && defined(SIGWINCH) */
 
-	TERM_CLEAR();
+	if (write(STDOUT_FILENO, "\033[2J", 4) != 4)
+		die("write:");
 	term_initialized = 1;
 }
 
@@ -628,17 +639,15 @@ term_shutdown(void)
 	if (fcntl(STDIN_FILENO, F_SETFL, old_stdin_flags) < 0)
 		die("fcntl:");
 
-	TERM_CLEAR();
+	if (write(STDOUT_FILENO, "\033[2J\033[;H", 8) != 8)
+		die("write:");
 }
 
 static int
-term_size(int size[2])
+term_size(int *w, int *h)
 {
 	/*
-	 * get the terminal's size and store it in size:
-	 * size[0] = width
-	 * size[1] = height
-	 *
+	 * get the terminal's size, storing the width in *w and height in *h.
 	 * if getting the size fails, return -1; otherwise, return 0.
 	 */
 	fd_set rfds;
@@ -648,16 +657,16 @@ term_size(int size[2])
 	char c = 0;
 	size_t i = 0;
 
-#if defined(TIOCGWINSZ)
+#if ENABLE_NONPOSIX && defined(TIOCGWINSZ)
 	/* if we have TIOCGWINSZ, find the window size with it */
 	struct winsize sz;
 	if (ioctl(STDIN_FILENO, TIOCGWINSZ, &sz) == 0 &&
 			sz.ws_col && sz.ws_row) {
-		size[0] = sz.ws_col;
-		size[1] = sz.ws_row;
+		*w = sz.ws_col;
+		*h = sz.ws_row;
 		return 0;
 	}
-#endif /* TIOCGWINSZ */
+#endif /* ENABLE_NONPOSIX && defined(TIOCGWINSZ) */
 
 	/*
 	 * if that failed or we don't have it, fall back to using
@@ -683,7 +692,7 @@ term_size(int size[2])
 	if (i < 2 || i == sizeof(buf))
 		return -1;
 	buf[i] = '\0';
-	if (sscanf(buf, "\033[%d;%dR", &size[1], &size[0]) != 2)
+	if (sscanf(buf, "\033[%d;%dR", h, w) != 2)
 		return -1;
 	return 0;
 }
@@ -707,14 +716,14 @@ try_read_chr(char *c)
 	return 1;
 }
 
-#if defined(SIGWINCH)
+#if ENABLE_NONPOSIX && defined(SIGWINCH)
 static void
 winch(int unused)
 {
 	(void)unused;
 	win_resized = 1;
 }
-#endif /* SIGWINCH */
+#endif /* ENABLE_NONPOSIX && defined(SIGWINCH) */
 
 /*
  * ============================================================================
@@ -957,7 +966,7 @@ cursor_down(struct state *st)
 	 * height is subtracted by 2 since we have to reserve the
 	 * last row for the command text or mode indicator
 	 */
-	if (st->y < st->size[1] - 2) {
+	if (st->y < st->h - 2) {
 		size_t elen = buf_elem_len(&st->buf, (size_t)++st->y);
 		if ((size_t)st->x > elen)
 			st->x = (int)elen;
@@ -968,7 +977,7 @@ cursor_down(struct state *st)
 static void
 cursor_right(struct state *st)
 {
-	if (st->x < st->size[0] - 1 && (size_t)st->x < buf_elem_len(&st->buf,
+	if (st->x < st->w - 1 && (size_t)st->x < buf_elem_len(&st->buf,
 				(size_t)st->y))
 		term_set_cursor(++st->x, st->y);
 }
@@ -1001,7 +1010,7 @@ static void
 cursor_startnextrow(struct state *st)
 {
 	/* same as earlier, subtract 2 to reserve one row */
-	if (st->y < st->size[1] - 2) {
+	if (st->y < st->h - 2) {
 		st->x = 0;
 		term_set_cursor(st->x, ++st->y);
 	}
@@ -1089,7 +1098,7 @@ exec_cmd(struct state *st)
 	if (cmdchrcmp(st->cmd.s, 'q')) {
 		/* :q || :q! */
 		if (st->cmd.s[1] != '!' && st->modified) {
-			term_print(0, st->size[1] - 1, COLOR_RED,
+			term_print(0, st->h - 1, COLOR_RED,
 					"buffer modified");
 			return -1;
 		}
@@ -1110,12 +1119,12 @@ exec_cmd(struct state *st)
 			if (buf_write(&st->buf, name,
 						bang || st->written) < 0) {
 				if (errno == EEXIST) {
-					term_print(0, st->size[1] - 1,
+					term_print(0, st->h - 1,
 							COLOR_RED,
 							"file exists (add ! "
 							"to override)");
 				} else {
-					term_printf(0, st->size[1] - 1,
+					term_printf(0, st->h - 1,
 							COLOR_RED,
 							"writing to file "
 							"failed: %s",
@@ -1126,7 +1135,7 @@ exec_cmd(struct state *st)
 			st->modified = 0;
 			st->written = 1;
 		} else {
-			term_print(0, st->size[1] - 1, COLOR_RED,
+			term_print(0, st->h - 1, COLOR_RED,
 					"no file name specified");
 			return -1;
 		}
@@ -1150,25 +1159,25 @@ key_command_line(struct state *st)
 		st->mode = MODE_NORMAL;
 		st->cmd.s[0] = '\0';
 		st->cmd.len = 0;
-		term_clear_row(st->size[1] - 1);
+		term_clear_row(st->h - 1);
 		st->x = st->storedx;
 		term_set_cursor(st->x, st->y);
 		break;
 	case KEY_ARROW_RIGHT:
 		/* move cursor right */
-		if (st->x < st->size[0] - 1 && (size_t)(st->x - 1) <
+		if (st->x < st->w - 1 && (size_t)(st->x - 1) <
 				st->cmd.len)
-			term_set_cursor(++st->x, st->size[1] - 1);
+			term_set_cursor(++st->x, st->h - 1);
 		break;
 	case KEY_ARROW_LEFT:
 		/* move cursor left */
 		if (st->x > 1)
-			term_set_cursor(--(st->x), st->size[1] - 1);
+			term_set_cursor(--(st->x), st->h - 1);
 		break;
 	case KEY_ENTER:
 		/* execute command and return to normal mode */
 		if (exec_cmd(st) >= 0)
-			term_clear_row(st->size[1] - 1);
+			term_clear_row(st->h - 1);
 		st->mode = MODE_NORMAL;
 		st->cmd.s[0] = '\0';
 		st->cmd.len = 0;
@@ -1183,9 +1192,9 @@ key_command_line(struct state *st)
 		 */
 		if (st->x > 1 && st->cmd.len) {
 			str_removechar(&st->cmd, (size_t)(st->x - 2));
-			term_printf(0, st->size[1] - 1, COLOR_DEFAULT,
+			term_printf(0, st->h - 1, COLOR_DEFAULT,
 					":%s", st->cmd.s);
-			term_set_cursor(--(st->x), st->size[1] - 1);
+			term_set_cursor(--(st->x), st->h - 1);
 		}
 		break;
 	case KEY_DELETE:
@@ -1195,20 +1204,20 @@ key_command_line(struct state *st)
 		 */
 		if (st->cmd.len) {
 			str_removechar(&st->cmd, (size_t)(st->x - 1));
-			term_printf(0, st->size[1] - 1, COLOR_DEFAULT,
+			term_printf(0, st->h - 1, COLOR_DEFAULT,
 					":%s", st->cmd.s);
-			term_set_cursor(st->x, st->size[1] - 1);
+			term_set_cursor(st->x, st->h - 1);
 		}
 		break;
 	case KEY_CHAR:
 		/* regular key */
-		if (st->x > 0 && st->x < st->size[0] - 1) {
+		if (st->x > 0 && st->x < st->w - 1) {
 			str_insertchar(&st->cmd, st->ev.ch,
 					(size_t)(st->x - 1),
 					CMD_SIZE_INCREMENT);
-			term_printf(0, st->size[1] - 1, COLOR_DEFAULT,
+			term_printf(0, st->h - 1, COLOR_DEFAULT,
 					":%s", st->cmd.s);
-			term_set_cursor(++st->x, st->size[1] - 1);
+			term_set_cursor(++st->x, st->h - 1);
 		}
 		break;
 	default:
@@ -1224,7 +1233,7 @@ key_insert(struct state *st)
 	case KEY_ESC:
 		/* go into normal mode */
 		st->mode = MODE_NORMAL;
-		term_clear_row(st->size[1] - 1);
+		term_clear_row(st->h - 1);
 		term_set_cursor(st->x, st->y);
 		break;
 	case KEY_ARROW_UP:
@@ -1274,7 +1283,7 @@ key_insert(struct state *st)
 		break;
 	case KEY_CHAR:
 		/* regular key */
-		if (st->x < st->size[0] - 1) {
+		if (st->x < st->w - 1) {
 			st->modified = 1;
 			buf_char_insert(&st->buf, (size_t)st->y, st->ev.ch,
 					(size_t)st->x);
@@ -1337,14 +1346,14 @@ key_normal(struct state *st)
 			break;
 		case 'i':
 			st->mode = MODE_INSERT;
-			term_print(0, st->size[1] - 1, COLOR_DEFAULT,
+			term_print(0, st->h - 1, COLOR_DEFAULT,
 					"INSERT");
 			term_set_cursor(st->x, st->y);
 			break;
 		case 'a':
 			cursor_right(st);
 			st->mode = MODE_INSERT;
-			term_print(0, st->size[1] - 1, COLOR_DEFAULT,
+			term_print(0, st->h - 1, COLOR_DEFAULT,
 					"INSERT");
 			term_set_cursor(st->x, st->y);
 			break;
@@ -1352,9 +1361,9 @@ key_normal(struct state *st)
 			st->mode = MODE_COMMAND_LINE;
 			st->storedx = st->x;
 			st->x = 1;
-			term_print(0, st->size[1] - 1, COLOR_DEFAULT,
+			term_print(0, st->h - 1, COLOR_DEFAULT,
 					":");
-			term_set_cursor(st->x, st->size[1] - 1);
+			term_set_cursor(st->x, st->h - 1);
 			break;
 		}
 	default:
@@ -1387,11 +1396,11 @@ run(int argc, char *argv[])
 	st.done = 0;
 
 	/* get terminal size */
-	if (term_size(st.size) < 0) {
-		st.size[0] = FALLBACK_WIDTH;
-		st.size[1] = FALLBACK_HEIGHT;
+	if (term_size(&st.w, &st.h) < 0) {
+		st.w = FALLBACK_WIDTH;
+		st.h = FALLBACK_HEIGHT;
 	}
-	if (st.size[1] < 2)
+	if (st.h < 2)
 		die("terminal height too low");
 
 	term_set_cursor(0, 0);
@@ -1401,27 +1410,29 @@ run(int argc, char *argv[])
 		term_event_wait(&st.ev);
 
 		switch (st.ev.type) {
-#if defined(SIGWINCH)
+#if ENABLE_NONPOSIX && defined(SIGWINCH)
 		case TERM_EVENT_RESIZE:
-			if (term_size(st.size) < 0) {
-				st.size[0] = FALLBACK_WIDTH;
-				st.size[1] = FALLBACK_HEIGHT;
+			if (term_size(&st.w, &st.h) < 0) {
+				st.w = FALLBACK_WIDTH;
+				st.h = FALLBACK_HEIGHT;
 			}
-			if (st.size[1] < 2)
+			if (st.h < 2)
 				die("terminal height too low");
+
+			term_set_cursor(st.x, st.y);
 
 			/*
 			 * check if current cursor position is now
 			 * outside the window, might happen if it
 			 * was resized to be smaller
 			 */
-			if (st.x >= st.size[0] - 1)
-				st.x = st.size[0] - 1;
-			if (st.y >= st.size[1] - 1)
-				st.y = st.size[1] - 1;
+			if (st.x >= st.w - 1)
+				st.x = st.w - 1;
+			if (st.y >= st.h - 1)
+				st.y = st.h - 1;
 
 			break;
-#endif /* SIGWINCH */
+#endif /* ENABLE_NONPOSIX && defined(SIGWINCH) */
 		case TERM_EVENT_KEY:
 			if (st.mode == MODE_COMMAND_LINE)
 				key_command_line(&st);
