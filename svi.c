@@ -27,9 +27,9 @@
 
 /*
  * TODO (from highest to lowest priority):
- * - pressing enter won't actually insert a new line, fix this
  * - scrolling
  * - opening files
+ * - add support for more movement keys
  * - optimize certain movements to use less escape sequences
  * - use select() in try_read_char to allow parsing of cursor key sequences
  *   if there's a delay between the characters
@@ -289,6 +289,8 @@ static void buf_create(struct buf *buf, size_t size);
 static size_t buf_elem_len(struct buf *buf, size_t elem);
 static void buf_free(const struct buf *buf);
 static void buf_resize(struct buf *buf, size_t size);
+static void buf_shift_down(struct buf *buf, size_t start_index,
+		size_t size_increment);
 static int buf_write(const struct buf *buf, const char *filename,
 		int overwrite);
 static int iov_write(struct iovec *iov, int *iovcnt, size_t iov_size,
@@ -897,6 +899,26 @@ buf_resize(struct buf *buf, size_t size)
 	}
 }
 
+static void
+buf_shift_down(struct buf *buf, size_t start_index, size_t size_increment)
+{
+	/*
+	 * shift every element of a buffer starting from the index
+	 * start_index (included) downwards by 1 element.
+	 *
+	 * if the buffer is too small, its size is increased by
+	 * size_increment elements.
+	 *
+	 * the newly created element has an unspecified value.
+	 */
+	if (buf->len + 1 > buf->size)
+		buf_resize(buf, buf->size + size_increment);
+
+	memmove(&buf->b[start_index + 1], &buf->b[start_index],
+			(buf->len - start_index) * sizeof(struct str *));
+	++buf->len;
+}
+
 static int
 buf_write(const struct buf *buf, const char *filename, int overwrite)
 {
@@ -1257,7 +1279,66 @@ key_insert(struct state *st)
 		cursor_left(st);
 		break;
 	case KEY_ENTER:
+		{
+		int row;
+		if ((size_t)st->y < st->buf.len) {
+			/* there is text on this row or after this row */
+			if (st->buf.b[st->y] && st->buf.b[st->y]->len) {
+				/*
+				 * there is text on this row and the cursor
+				 * is located inside some text, shift the
+				 * text after the cursor down to the next row
+				 */
+
+				/* length of new row */
+				size_t newlen = st->buf.b[st->y]->len -
+					(size_t)st->x;
+
+				/* size of new row */
+				size_t newsize = ROUNDUPTO(newlen,
+						ROW_SIZE_INCREMENT);
+
+				/* shift down all rows below cursor */
+				buf_shift_down(&st->buf, (size_t)(st->y + 1),
+						BUF_SIZE_INCREMENT);
+
+				/* create new row in the newly freed space */
+				st->buf.b[st->y + 1] = emalloc(
+						sizeof(struct str));
+				st->buf.b[st->y + 1]->s = emalloc(newsize);
+
+				/*
+				 * copy over the portion of the old row after
+				 * the cursor
+				 */
+				memcpy(st->buf.b[st->y + 1]->s,
+						st->buf.b[st->y]->s + st->x,
+						newlen);
+				st->buf.b[st->y + 1]->s[newlen] = '\0';
+				st->buf.b[st->y + 1]->len = newlen;
+				st->buf.b[st->y + 1]->size = newsize;
+
+				/* cut off the old row at the cursor */
+				st->buf.b[st->y]->s[st->x] = '\0';
+				st->buf.b[st->y]->len = (size_t)st->x;
+			} else {
+				/* there is no text on this row */
+				buf_shift_down(&st->buf, (size_t)st->y,
+						BUF_SIZE_INCREMENT);
+				st->buf.b[st->y] = NULL;
+			}
+		}
+
+		/* redraw the screen */
+		for (row = st->y; row < (int)st->buf.len; ++row) {
+			if (st->buf.b[row] && st->buf.b[row]->len)
+				term_print(0, row, COLOR_DEFAULT,
+						st->buf.b[row]->s);
+			else
+				term_clear_row(row);
+		}
 		cursor_startnextrow(st);
+		}
 		break;
 	case KEY_BACKSPACE:
 		/*
