@@ -27,8 +27,6 @@
 
 /*
  * TODO (from highest to lowest priority):
- * - optimize scrolling downwards, maybe "\r\n\r\n" + redraw bottom row
- *   will work
  * - if a resize happens, clear & redraw the screen
  * - opening files
  * - rendering of long lines (line-wrap)
@@ -316,7 +314,7 @@ static void cursor_right(struct state *st);
 static void cursor_left(struct state *st);
 static void cursor_linestart(struct state *st);
 static void cursor_lineend(struct state *st);
-static void cursor_startnextrow(struct state *st);
+static void cursor_startnextrow(struct state *st, int stripextranewline);
 
 /* commands */
 static const char *cmdarg(const char *cmd);
@@ -602,8 +600,7 @@ term_init(void)
 		die("sigprocmask:");
 #endif /* ENABLE_NONPOSIX && defined(SIGWINCH) */
 
-	if (write(STDOUT_FILENO, "\033[2J", 4) != 4)
-		die("write:");
+	write(STDOUT_FILENO, "\033[2J", 4);
 	term_initialized = 1;
 }
 
@@ -667,8 +664,7 @@ term_shutdown(void)
 	if (fcntl(STDIN_FILENO, F_SETFL, old_stdin_flags) < 0)
 		die("fcntl:");
 
-	if (write(STDOUT_FILENO, "\033[2J\033[;H", 8) != 8)
-		die("write:");
+	write(STDOUT_FILENO, "\033[2J\033[;H", 8);
 }
 
 static int
@@ -1022,10 +1018,13 @@ cursor_down(struct state *st)
 		size_t elen = buf_elem_len(&st->buf, (size_t)++st->y);
 		if ((size_t)st->x > elen)
 			st->x = st->tx = (int)elen;
-		if (st->ty < st->h - 2)
+
+		if (st->ty < st->h - 2) {
 			++st->ty;
-		else
-			redraw(st, st->y - (st->h - 2), 0, st->h - 2);
+		} else {
+			write(STDOUT_FILENO, "\r\n\r\n", 4);
+			redraw_row(st, st->y, st->h - 2);
+		}
 		term_set_cursor(st->tx, st->ty);
 	}
 }
@@ -1067,15 +1066,22 @@ cursor_lineend(struct state *st)
 }
 
 static void
-cursor_startnextrow(struct state *st)
+cursor_startnextrow(struct state *st, int stripextranewline)
 {
 	if (st->buf.len && (size_t)st->y < st->buf.len - 1) {
 		++st->y;
 		st->x = st->tx = 0;
-		if (st->ty < st->h - 2)
+
+
+		if (st->ty < st->h - 2) {
 			++st->ty;
-		else
-			redraw(st, st->y - (st->h - 2), 0, st->h - 2);
+		} else {
+			if (stripextranewline)
+				write(STDOUT_FILENO, "\r\n", 2);
+			else
+				write(STDOUT_FILENO, "\r\n\r\n", 4);
+			redraw_row(st, st->y, st->h - 2);
+		}
 		term_set_cursor(st->tx, st->ty);
 	}
 }
@@ -1273,7 +1279,7 @@ insert_newline(struct state *st)
 		++st->buf.len;
 		term_clear_row(st->y + 1);
 	}
-	cursor_startnextrow(st);
+	cursor_startnextrow(st, 1);
 }
 
 static void
@@ -1475,7 +1481,7 @@ key_normal(struct state *st)
 		cursor_left(st);
 		break;
 	case KEY_ENTER:
-		cursor_startnextrow(st);
+		cursor_startnextrow(st, 0);
 		break;
 	case KEY_BACKSPACE:
 		/* move to previous char */
