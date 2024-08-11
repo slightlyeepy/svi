@@ -27,12 +27,18 @@
 
 /*
  * TODO (from highest to lowest priority):
- * - scrolling
+ * - optimize scrolling downwards, maybe "\r\n\r\n" + redraw bottom row
+ *   will work
+ * - if a resize happens, clear & redraw the screen
  * - opening files
+ * - rendering of long lines (line-wrap)
+ * - write data to file when exiting due to error
  * - add support for more movement keys
- * - optimize certain movements to use less escape sequences
  * - use select() in try_read_char to allow parsing of cursor key sequences
  *   if there's a delay between the characters
+ * - scrolling the screen up redraws the whole screen; is there a more
+ *   efficient way to do this?
+ * - optimize certain movements to use less escape sequences
  * - optimize memory usage on large files
  * - UTF-8 support
  * - maybe try to handle OOM more gracefully instead of exiting instantly
@@ -53,7 +59,7 @@
  * sys/param.h, ioctl, TIOCGWINSZ, and SIGWINCH).
  * 0 = false, 1 = true
  */
-#define ENABLE_NONPOSIX 1
+#define ENABLE_NONPOSIX 0
 
 /* enable usage of OpenBSD's pledge(2). 0 = false, 1 = true */
 #define ENABLE_PLEDGE   0
@@ -155,7 +161,9 @@ typedef uint64_t __u64;
 
 #include <errno.h>
 #include <fcntl.h>
+#if ENABLE_NONPOSIX
 #include <signal.h>
+#endif /* ENABLE_NONPOSIX */
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -180,6 +188,10 @@ typedef uint64_t __u64;
 #define COLOR_MAGENTA "\033[35m"
 #define COLOR_CYAN    "\033[36m"
 #define COLOR_WHITE   "\033[37m"
+
+/* buffer management */
+#define BUF_ELEM_NOTEMPTY(buf, elem) ((size_t)elem < buf.size && \
+		(size_t)elem < buf.len && buf.b[elem] && buf.b[elem]->len)
 
 /* utility */
 #define ROUNDUPTO(x, multiple) (((x + multiple - 1) / multiple) * multiple)
@@ -232,10 +244,11 @@ struct state {
 	struct str cmd; /* string used to hold commands */
 
 	int w, h; /* window dimensions */
-	int x, y; /* cursor's current position */
+	int x, y; /* cursor's current position in the editing buffer */
+	int tx, ty; /* cursor's current position on-screen */
 
 	enum mode mode; /* current mode */
-	int storedx; /* x position before entering command-line mode */
+	int storedtx; /* value of tx before entering command-line mode */
 
 	char *name; /* name of file being edited */
 	int name_needs_free; /* whether name should be free()'d */
@@ -301,8 +314,8 @@ static void cursor_up(struct state *st);
 static void cursor_down(struct state *st);
 static void cursor_right(struct state *st);
 static void cursor_left(struct state *st);
-static void cursor_start(struct state *st);
-static void cursor_end(struct state *st);
+static void cursor_linestart(struct state *st);
+static void cursor_lineend(struct state *st);
 static void cursor_startnextrow(struct state *st);
 
 /* commands */
@@ -310,6 +323,11 @@ static const char *cmdarg(const char *cmd);
 static int cmdchrcmp(const char *cmd, char c);
 static int cmdstrcmp(const char *cmd, const char *s, size_t sl);
 static int exec_cmd(struct state *st);
+
+/* helper functions */
+static void insert_newline(struct state *st);
+static void redraw(struct state *st, int start_y, int start_ty, int end_ty);
+static void redraw_row(struct state *st, int y, int ty);
 
 /* main program loop */
 static void key_command_line(struct state *st);
@@ -809,8 +827,12 @@ buf_char_insert(struct buf *buf, size_t elem, char c, size_t index)
 	 * insert a character into a specific element of a buffer,
 	 * creating it if it doesn't exist.
 	 */
-	if (elem >= buf->size)
-		buf_resize(buf, ROUNDUPTO(elem, BUF_SIZE_INCREMENT));
+	if (elem >= buf->size) {
+		size_t newsize = elem;
+		if (newsize % BUF_SIZE_INCREMENT == 0)
+			++newsize;
+		buf_resize(buf, ROUNDUPTO(newsize, BUF_SIZE_INCREMENT));
+	}
 	if (elem >= buf->len)
 		buf->len = elem + 1;
 	if (!buf->b[elem]) {
@@ -838,7 +860,7 @@ buf_create(struct buf *buf, size_t size)
 {
 	/* create a new buffer. */
 	buf->b = ecalloc(size, sizeof(struct str *));
-	buf->len = 0;
+	buf->len = 1;
 	buf->size = size;
 }
 
@@ -982,25 +1004,29 @@ static void
 cursor_up(struct state *st)
 {
 	if (st->y > 0) {
-		size_t elen = buf_elem_len(&st->buf, (size_t)--(st->y));
+		size_t elen = buf_elem_len(&st->buf, (size_t)--st->y);
 		if ((size_t)st->x > elen)
-			st->x = (int)elen;
-		term_set_cursor(st->x, st->y);
+			st->x = st->tx = (int)elen;
+		if (st->ty > 0)
+			--st->ty;
+		else
+			redraw(st, st->y, 0, st->h - 2);
+		term_set_cursor(st->tx, st->ty);
 	}
 }
 
 static void
 cursor_down(struct state *st)
 {
-	/*
-	 * height is subtracted by 2 since we have to reserve the
-	 * last row for the command text or mode indicator
-	 */
-	if (st->y < st->h - 2) {
+	if (st->buf.len && (size_t)st->y < st->buf.len - 1) {
 		size_t elen = buf_elem_len(&st->buf, (size_t)++st->y);
 		if ((size_t)st->x > elen)
-			st->x = (int)elen;
-		term_set_cursor(st->x, st->y);
+			st->x = st->tx = (int)elen;
+		if (st->ty < st->h - 2)
+			++st->ty;
+		else
+			redraw(st, st->y - (st->h - 2), 0, st->h - 2);
+		term_set_cursor(st->tx, st->ty);
 	}
 }
 
@@ -1008,41 +1034,49 @@ static void
 cursor_right(struct state *st)
 {
 	if (st->x < st->w - 1 && (size_t)st->x < buf_elem_len(&st->buf,
-				(size_t)st->y))
-		term_set_cursor(++st->x, st->y);
+				(size_t)st->y)) {
+		++st->x;
+		term_set_cursor(++st->tx, st->ty);
+	}
 }
 
 static void
 cursor_left(struct state *st)
 {
-	if (st->x > 0)
-		term_set_cursor(--(st->x), st->y);
+	if (st->x > 0) {
+		--st->x;
+		term_set_cursor(--st->tx, st->ty);
+	}
 }
 
 static void
-cursor_start(struct state *st)
+cursor_linestart(struct state *st)
 {
-	st->x = 0;
-	term_set_cursor(st->x, st->y);
+	st->x = st->tx = 0;
+	term_set_cursor(st->tx, st->ty);
 }
 
 static void
-cursor_end(struct state *st)
+cursor_lineend(struct state *st)
 {
 	size_t l = buf_elem_len(&st->buf, (size_t)st->y);
 	if (l)
 		--l;
-	st->x = (int)l;
-	term_set_cursor(st->x, st->y);
+	st->x = st->tx = (int)l;
+	term_set_cursor(st->tx, st->ty);
 }
 
 static void
 cursor_startnextrow(struct state *st)
 {
-	/* same as earlier, subtract 2 to reserve one row */
-	if (st->y < st->h - 2) {
-		st->x = 0;
-		term_set_cursor(st->x, ++st->y);
+	if (st->buf.len && (size_t)st->y < st->buf.len - 1) {
+		++st->y;
+		st->x = st->tx = 0;
+		if (st->ty < st->h - 2)
+			++st->ty;
+		else
+			redraw(st, st->y - (st->h - 2), 0, st->h - 2);
+		term_set_cursor(st->tx, st->ty);
 	}
 }
 
@@ -1050,8 +1084,12 @@ static void
 cursor_endpreviousrow(struct state *st)
 {
 	if (st->y > 0) {
-		st->x = (int)buf_elem_len(&st->buf, (size_t)--(st->y));
-		term_set_cursor(st->x, st->y);
+		st->x = st->tx = (int)buf_elem_len(&st->buf, (size_t)--st->y);
+		if (st->ty > 0)
+			--st->ty;
+		else
+			redraw(st, st->y, 0, st->h - 2);
+		term_set_cursor(st->tx, st->ty);
 	}
 }
 
@@ -1177,6 +1215,96 @@ exec_cmd(struct state *st)
 
 /*
  * ============================================================================
+ * helper functions
+ */
+static void
+insert_newline(struct state *st)
+{
+	if (BUF_ELEM_NOTEMPTY(st->buf, st->y) &&
+			(size_t)st->x < st->buf.b[st->y]->len) {
+		/*
+		 * there is text on this row and the cursor
+		 * is located inside some text, shift the
+		 * text after the cursor down to the next row
+		 */
+
+		/* length of new row */
+		size_t newlen = st->buf.b[st->y]->len - (size_t)st->x;
+
+		/* size of new row */
+		size_t newsize = ROUNDUPTO(newlen, ROW_SIZE_INCREMENT);
+
+		/* shift down all rows below cursor */
+		buf_shift_down(&st->buf, (size_t)(st->y + 1),
+				BUF_SIZE_INCREMENT);
+
+		/* create new row in the newly freed space */
+		st->buf.b[st->y + 1] = emalloc(sizeof(struct str));
+		st->buf.b[st->y + 1]->s = emalloc(newsize);
+
+		/*
+		 * copy over the portion of the old row after
+		 * the cursor
+		 */
+		memcpy(st->buf.b[st->y + 1]->s, st->buf.b[st->y]->s + st->x,
+				newlen);
+		st->buf.b[st->y + 1]->s[newlen] = '\0';
+		st->buf.b[st->y + 1]->len = newlen;
+		st->buf.b[st->y + 1]->size = newsize;
+
+		/* cut off the old row at the cursor */
+		st->buf.b[st->y]->s[st->x] = '\0';
+		st->buf.b[st->y]->len = (size_t)st->x;
+
+		/* redraw screen */
+		redraw(st, st->y, st->ty, st->h - 2);
+	} else if ((size_t)st->y < st->buf.len - 1) {
+		/*
+		 * there is no text on this row, but there is
+		 * text after this row
+		 */
+		buf_shift_down(&st->buf, (size_t)st->y, BUF_SIZE_INCREMENT);
+		st->buf.b[st->y] = NULL;
+
+		/* redraw screen */
+		redraw(st, st->y, st->ty, st->h - 2);
+	} else {
+		/* there's no text after this row */
+		++st->buf.len;
+		term_clear_row(st->y + 1);
+	}
+	cursor_startnextrow(st);
+}
+
+static void
+redraw(struct state *st, int start_y, int start_ty, int end_ty)
+{
+	/*
+	 * redraw a portion of the screen starting from start_ty and
+	 * ending at end_ty (both included).
+	 *
+	 * the content of the redrawn rows is the buffer element at index
+	 * [start_y + how many rows have already been drawn].
+	 */
+	for (; start_ty <= end_ty; ++start_ty)
+		redraw_row(st, start_y++, start_ty);
+}
+
+static void
+redraw_row(struct state *st, int y, int ty)
+{
+	if ((size_t)y < st->buf.len) {
+		if (BUF_ELEM_NOTEMPTY(st->buf, y))
+			term_print(0, ty, COLOR_DEFAULT, st->buf.b[y]->s);
+		else
+			term_clear_row(ty);
+	} else {
+		term_print(0, ty, COLOR_DEFAULT, "~");
+	}
+}
+
+/*
+ * ============================================================================
  * main program loop
  */
 static void
@@ -1190,19 +1318,19 @@ key_command_line(struct state *st)
 		st->cmd.s[0] = '\0';
 		st->cmd.len = 0;
 		term_clear_row(st->h - 1);
-		st->x = st->storedx;
-		term_set_cursor(st->x, st->y);
+		st->tx = st->storedtx;
+		term_set_cursor(st->tx, st->ty);
 		break;
 	case KEY_ARROW_RIGHT:
 		/* move cursor right */
-		if (st->x < st->w - 1 && (size_t)(st->x - 1) <
+		if (st->tx < st->w - 1 && (size_t)(st->tx - 1) <
 				st->cmd.len)
-			term_set_cursor(++st->x, st->h - 1);
+			term_set_cursor(++st->tx, st->h - 1);
 		break;
 	case KEY_ARROW_LEFT:
 		/* move cursor left */
-		if (st->x > 1)
-			term_set_cursor(--(st->x), st->h - 1);
+		if (st->tx > 1)
+			term_set_cursor(--st->tx, st->h - 1);
 		break;
 	case KEY_ENTER:
 		/* execute command and return to normal mode */
@@ -1211,8 +1339,8 @@ key_command_line(struct state *st)
 		st->mode = MODE_NORMAL;
 		st->cmd.s[0] = '\0';
 		st->cmd.len = 0;
-		st->x = st->storedx;
-		term_set_cursor(st->x, st->y);
+		st->tx = st->storedtx;
+		term_set_cursor(st->tx, st->y);
 		break;
 	case KEY_BACKSPACE:
 		/*
@@ -1220,11 +1348,11 @@ key_command_line(struct state *st)
 		 * at the beginning of the row and there's
 		 * some text on the current row
 		 */
-		if (st->x > 1 && st->cmd.len) {
-			str_removechar(&st->cmd, (size_t)(st->x - 2));
+		if (st->tx > 1 && st->cmd.len) {
+			str_removechar(&st->cmd, (size_t)(st->tx - 2));
 			term_printf(0, st->h - 1, COLOR_DEFAULT,
 					":%s", st->cmd.s);
-			term_set_cursor(--(st->x), st->h - 1);
+			term_set_cursor(--st->tx, st->h - 1);
 		}
 		break;
 	case KEY_DELETE:
@@ -1233,21 +1361,21 @@ key_command_line(struct state *st)
 		 * text on the current row
 		 */
 		if (st->cmd.len) {
-			str_removechar(&st->cmd, (size_t)(st->x - 1));
+			str_removechar(&st->cmd, (size_t)(st->tx - 1));
 			term_printf(0, st->h - 1, COLOR_DEFAULT,
 					":%s", st->cmd.s);
-			term_set_cursor(st->x, st->h - 1);
+			term_set_cursor(st->tx, st->h - 1);
 		}
 		break;
 	case KEY_CHAR:
 		/* regular key */
-		if (st->x > 0 && st->x < st->w - 1) {
+		if (st->tx > 0 && st->tx < st->w - 1) {
 			str_insertchar(&st->cmd, st->ev.ch,
-					(size_t)(st->x - 1),
+					(size_t)(st->tx - 1),
 					CMD_SIZE_INCREMENT);
 			term_printf(0, st->h - 1, COLOR_DEFAULT,
 					":%s", st->cmd.s);
-			term_set_cursor(++st->x, st->h - 1);
+			term_set_cursor(++st->tx, st->h - 1);
 		}
 		break;
 	default:
@@ -1264,7 +1392,7 @@ key_insert(struct state *st)
 		/* go into normal mode */
 		st->mode = MODE_NORMAL;
 		term_clear_row(st->h - 1);
-		term_set_cursor(st->x, st->y);
+		term_set_cursor(st->tx, st->ty);
 		break;
 	case KEY_ARROW_UP:
 		cursor_up(st);
@@ -1279,66 +1407,8 @@ key_insert(struct state *st)
 		cursor_left(st);
 		break;
 	case KEY_ENTER:
-		{
-		int row;
-		if ((size_t)st->y < st->buf.len) {
-			/* there is text on this row or after this row */
-			if (st->buf.b[st->y] && st->buf.b[st->y]->len) {
-				/*
-				 * there is text on this row and the cursor
-				 * is located inside some text, shift the
-				 * text after the cursor down to the next row
-				 */
-
-				/* length of new row */
-				size_t newlen = st->buf.b[st->y]->len -
-					(size_t)st->x;
-
-				/* size of new row */
-				size_t newsize = ROUNDUPTO(newlen,
-						ROW_SIZE_INCREMENT);
-
-				/* shift down all rows below cursor */
-				buf_shift_down(&st->buf, (size_t)(st->y + 1),
-						BUF_SIZE_INCREMENT);
-
-				/* create new row in the newly freed space */
-				st->buf.b[st->y + 1] = emalloc(
-						sizeof(struct str));
-				st->buf.b[st->y + 1]->s = emalloc(newsize);
-
-				/*
-				 * copy over the portion of the old row after
-				 * the cursor
-				 */
-				memcpy(st->buf.b[st->y + 1]->s,
-						st->buf.b[st->y]->s + st->x,
-						newlen);
-				st->buf.b[st->y + 1]->s[newlen] = '\0';
-				st->buf.b[st->y + 1]->len = newlen;
-				st->buf.b[st->y + 1]->size = newsize;
-
-				/* cut off the old row at the cursor */
-				st->buf.b[st->y]->s[st->x] = '\0';
-				st->buf.b[st->y]->len = (size_t)st->x;
-			} else {
-				/* there is no text on this row */
-				buf_shift_down(&st->buf, (size_t)st->y,
-						BUF_SIZE_INCREMENT);
-				st->buf.b[st->y] = NULL;
-			}
-		}
-
-		/* redraw the screen */
-		for (row = st->y; row < (int)st->buf.len; ++row) {
-			if (st->buf.b[row] && st->buf.b[row]->len)
-				term_print(0, row, COLOR_DEFAULT,
-						st->buf.b[row]->s);
-			else
-				term_clear_row(row);
-		}
-		cursor_startnextrow(st);
-		}
+		st->modified = 1;
+		insert_newline(st);
 		break;
 	case KEY_BACKSPACE:
 		/*
@@ -1346,14 +1416,14 @@ key_insert(struct state *st)
 		 * at the beginning of the row and there's
 		 * some text on the current row
 		 */
-		if (st->x > 0 && st->buf.b[st->y] &&
-				st->buf.b[st->y]->len) {
+		if (st->x > 0 && BUF_ELEM_NOTEMPTY(st->buf, st->y)) {
 			st->modified = 1;
 			buf_char_remove(&st->buf, (size_t)st->y,
-					(size_t)(st->x - 1));
-			term_print(0, st->y, COLOR_DEFAULT,
+					(size_t)--st->x);
+			--st->tx;
+			term_print(0, st->ty, COLOR_DEFAULT,
 					st->buf.b[st->y]->s);
-			term_set_cursor(--(st->x), st->y);
+			term_set_cursor(st->tx, st->ty);
 		}
 		break;
 	case KEY_DELETE:
@@ -1361,13 +1431,13 @@ key_insert(struct state *st)
 		 * remove char at cursor, if there's some
 		 * text on the current row
 		 */
-		if (st->buf.b[st->y] && st->buf.b[st->y]->len) {
+		if (BUF_ELEM_NOTEMPTY(st->buf, st->y)) {
 			st->modified = 1;
 			buf_char_remove(&st->buf, (size_t)st->y,
 					(size_t)st->x);
-			term_print(0, st->y, COLOR_DEFAULT,
+			term_print(0, st->ty, COLOR_DEFAULT,
 					st->buf.b[st->y]->s);
-			term_set_cursor(st->x, st->y);
+			term_set_cursor(st->tx, st->ty);
 		}
 		break;
 	case KEY_CHAR:
@@ -1376,9 +1446,10 @@ key_insert(struct state *st)
 			st->modified = 1;
 			buf_char_insert(&st->buf, (size_t)st->y, st->ev.ch,
 					(size_t)st->x);
-			term_print(0, st->y, COLOR_DEFAULT,
+			term_print(0, st->ty, COLOR_DEFAULT,
 					st->buf.b[st->y]->s);
-			term_set_cursor(++st->x, st->y);
+			++st->x;
+			term_set_cursor(++st->tx, st->ty);
 		}
 		break;
 	default:
@@ -1428,31 +1499,25 @@ key_normal(struct state *st)
 			cursor_right(st);
 			break;
 		case '0':
-			cursor_start(st);
+			cursor_linestart(st);
 			break;
 		case '$':
-			cursor_end(st);
+			cursor_lineend(st);
 			break;
 		case 'i':
 			st->mode = MODE_INSERT;
-			term_print(0, st->h - 1, COLOR_DEFAULT,
-					"INSERT");
-			term_set_cursor(st->x, st->y);
 			break;
 		case 'a':
 			cursor_right(st);
 			st->mode = MODE_INSERT;
-			term_print(0, st->h - 1, COLOR_DEFAULT,
-					"INSERT");
-			term_set_cursor(st->x, st->y);
 			break;
 		case ':':
 			st->mode = MODE_COMMAND_LINE;
-			st->storedx = st->x;
-			st->x = 1;
+			st->storedtx = st->tx;
+			st->tx = 1;
 			term_print(0, st->h - 1, COLOR_DEFAULT,
 					":");
-			term_set_cursor(st->x, st->h - 1);
+			term_set_cursor(st->tx, st->h - 1);
 			break;
 		}
 	default:
@@ -1474,15 +1539,10 @@ run(int argc, char *argv[])
 	st.cmd.len = 0;
 	st.cmd.size = INITIAL_ROW_SIZE;
 
-	st.x = 0;
-	st.y = 0;
+	st.x = st.y = st.tx = st.ty = st.storedtx = 0;
 	st.mode = MODE_NORMAL;
-	st.storedx = 0;
 	st.name = (argc > 1) ? argv[1] : NULL;
-	st.name_needs_free = 0;
-	st.modified = 0;
-	st.written = 0;
-	st.done = 0;
+	st.name_needs_free = st.modified = st.written = st.done = 0;
 
 	/* get terminal size */
 	if (term_size(&st.w, &st.h) < 0) {
@@ -1492,6 +1552,7 @@ run(int argc, char *argv[])
 	if (st.h < 2)
 		die("terminal height too low");
 
+	redraw(&st, 0, 0, st.h - 2);
 	term_set_cursor(0, 0);
 
 	/* main loop */
@@ -1508,7 +1569,7 @@ run(int argc, char *argv[])
 			if (st.h < 2)
 				die("terminal height too low");
 
-			term_set_cursor(st.x, st.y);
+			term_set_cursor(st.tx, st.ty);
 
 			/*
 			 * check if current cursor position is now
