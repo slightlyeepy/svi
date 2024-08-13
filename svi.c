@@ -27,7 +27,6 @@
 
 /*
  * TODO (from highest to lowest priority):
- * - if a resize happens, clear & redraw the screen
  * - opening files
  * - rendering of long lines (line-wrap)
  * - write data to file when exiting due to error
@@ -57,7 +56,7 @@
  * sys/param.h, ioctl, TIOCGWINSZ, and SIGWINCH).
  * 0 = false, 1 = true
  */
-#define ENABLE_NONPOSIX 0
+#define ENABLE_NONPOSIX 1
 
 /* enable usage of OpenBSD's pledge(2). 0 = false, 1 = true */
 #define ENABLE_PLEDGE   0
@@ -203,7 +202,6 @@ enum event_type {
 };
 
 enum key {
-	KEY_CHAR,
 	KEY_ESC,
 	KEY_ARROW_UP,
 	KEY_ARROW_DOWN,
@@ -211,7 +209,9 @@ enum key {
 	KEY_ARROW_LEFT,
 	KEY_ENTER,
 	KEY_BACKSPACE,
-	KEY_DELETE
+	KEY_DELETE,
+	KEY_CTRL,
+	KEY_CHAR
 };
 
 enum mode {
@@ -243,10 +243,10 @@ struct state {
 
 	int w, h; /* window dimensions */
 	int x, y; /* cursor's current position in the editing buffer */
-	int tx, ty; /* cursor's current position on-screen */
+	int ty; /* cursor's current Y position on-screen */
 
 	enum mode mode; /* current mode */
-	int storedtx; /* value of tx before entering command-line mode */
+	int storedx; /* value of x before entering command-line mode */
 
 	char *name; /* name of file being edited */
 	int name_needs_free; /* whether name should be free()'d */
@@ -327,10 +327,13 @@ static void insert_newline(struct state *st);
 static void redraw(struct state *st, int start_y, int start_ty, int end_ty);
 static void redraw_row(struct state *st, int y, int ty);
 
-/* main program loop */
+/* event handling */
 static void key_command_line(struct state *st);
 static void key_insert(struct state *st);
 static void key_normal(struct state *st);
+static void resized(struct state *st);
+
+/* main program loop */
 static void run(int argc, char *argv[]);
 
 /*
@@ -486,8 +489,13 @@ readkey(struct term_event *ev)
 			ev->key = KEY_BACKSPACE;
 			return;
 		default:
-			/* another key, currently only ASCII is supported */
-			if (c < 0x7f) {
+			if (c < 0x20) {
+				/* ctrl+<something> */
+				ev->key = KEY_CTRL;
+				ev->ch = c + 0x40;
+				return;
+			} else if (c < 0x7f) {
+				/* regular ASCII char */
 				ev->key = KEY_CHAR;
 				ev->ch = c;
 				return;
@@ -1002,12 +1010,12 @@ cursor_up(struct state *st)
 	if (st->y > 0) {
 		size_t elen = buf_elem_len(&st->buf, (size_t)--st->y);
 		if ((size_t)st->x > elen)
-			st->x = st->tx = (int)elen;
+			st->x = (int)elen;
 		if (st->ty > 0)
 			--st->ty;
 		else
 			redraw(st, st->y, 0, st->h - 2);
-		term_set_cursor(st->tx, st->ty);
+		term_set_cursor(st->x, st->ty);
 	}
 }
 
@@ -1017,7 +1025,7 @@ cursor_down(struct state *st)
 	if (st->buf.len && (size_t)st->y < st->buf.len - 1) {
 		size_t elen = buf_elem_len(&st->buf, (size_t)++st->y);
 		if ((size_t)st->x > elen)
-			st->x = st->tx = (int)elen;
+			st->x = (int)elen;
 
 		if (st->ty < st->h - 2) {
 			++st->ty;
@@ -1025,7 +1033,7 @@ cursor_down(struct state *st)
 			write(STDOUT_FILENO, "\r\n\r\n", 4);
 			redraw_row(st, st->y, st->h - 2);
 		}
-		term_set_cursor(st->tx, st->ty);
+		term_set_cursor(st->x, st->ty);
 	}
 }
 
@@ -1033,26 +1041,22 @@ static void
 cursor_right(struct state *st)
 {
 	if (st->x < st->w - 1 && (size_t)st->x < buf_elem_len(&st->buf,
-				(size_t)st->y)) {
-		++st->x;
-		term_set_cursor(++st->tx, st->ty);
-	}
+				(size_t)st->y))
+		term_set_cursor(++st->x, st->ty);
 }
 
 static void
 cursor_left(struct state *st)
 {
-	if (st->x > 0) {
-		--st->x;
-		term_set_cursor(--st->tx, st->ty);
-	}
+	if (st->x > 0)
+		term_set_cursor(--st->x, st->ty);
 }
 
 static void
 cursor_linestart(struct state *st)
 {
-	st->x = st->tx = 0;
-	term_set_cursor(st->tx, st->ty);
+	st->x = 0;
+	term_set_cursor(st->x, st->ty);
 }
 
 static void
@@ -1061,8 +1065,8 @@ cursor_lineend(struct state *st)
 	size_t l = buf_elem_len(&st->buf, (size_t)st->y);
 	if (l)
 		--l;
-	st->x = st->tx = (int)l;
-	term_set_cursor(st->tx, st->ty);
+	st->x = (int)l;
+	term_set_cursor(st->x, st->ty);
 }
 
 static void
@@ -1070,8 +1074,7 @@ cursor_startnextrow(struct state *st, int stripextranewline)
 {
 	if (st->buf.len && (size_t)st->y < st->buf.len - 1) {
 		++st->y;
-		st->x = st->tx = 0;
-
+		st->x = 0;
 
 		if (st->ty < st->h - 2) {
 			++st->ty;
@@ -1082,7 +1085,7 @@ cursor_startnextrow(struct state *st, int stripextranewline)
 				write(STDOUT_FILENO, "\r\n\r\n", 4);
 			redraw_row(st, st->y, st->h - 2);
 		}
-		term_set_cursor(st->tx, st->ty);
+		term_set_cursor(st->x, st->ty);
 	}
 }
 
@@ -1090,12 +1093,12 @@ static void
 cursor_endpreviousrow(struct state *st)
 {
 	if (st->y > 0) {
-		st->x = st->tx = (int)buf_elem_len(&st->buf, (size_t)--st->y);
+		st->x = (int)buf_elem_len(&st->buf, (size_t)--st->y);
 		if (st->ty > 0)
 			--st->ty;
 		else
 			redraw(st, st->y, 0, st->h - 2);
-		term_set_cursor(st->tx, st->ty);
+		term_set_cursor(st->x, st->ty);
 	}
 }
 
@@ -1311,7 +1314,7 @@ redraw_row(struct state *st, int y, int ty)
 
 /*
  * ============================================================================
- * main program loop
+ * event handling
  */
 static void
 key_command_line(struct state *st)
@@ -1324,19 +1327,19 @@ key_command_line(struct state *st)
 		st->cmd.s[0] = '\0';
 		st->cmd.len = 0;
 		term_clear_row(st->h - 1);
-		st->tx = st->storedtx;
-		term_set_cursor(st->tx, st->ty);
+		st->x = st->storedx;
+		term_set_cursor(st->x, st->ty);
 		break;
 	case KEY_ARROW_RIGHT:
 		/* move cursor right */
-		if (st->tx < st->w - 1 && (size_t)(st->tx - 1) <
+		if (st->x < st->w - 1 && (size_t)(st->x - 1) <
 				st->cmd.len)
-			term_set_cursor(++st->tx, st->h - 1);
+			term_set_cursor(++st->x, st->h - 1);
 		break;
 	case KEY_ARROW_LEFT:
 		/* move cursor left */
-		if (st->tx > 1)
-			term_set_cursor(--st->tx, st->h - 1);
+		if (st->x > 1)
+			term_set_cursor(--st->x, st->h - 1);
 		break;
 	case KEY_ENTER:
 		/* execute command and return to normal mode */
@@ -1345,8 +1348,8 @@ key_command_line(struct state *st)
 		st->mode = MODE_NORMAL;
 		st->cmd.s[0] = '\0';
 		st->cmd.len = 0;
-		st->tx = st->storedtx;
-		term_set_cursor(st->tx, st->y);
+		st->x = st->storedx;
+		term_set_cursor(st->x, st->y);
 		break;
 	case KEY_BACKSPACE:
 		/*
@@ -1354,11 +1357,11 @@ key_command_line(struct state *st)
 		 * at the beginning of the row and there's
 		 * some text on the current row
 		 */
-		if (st->tx > 1 && st->cmd.len) {
-			str_removechar(&st->cmd, (size_t)(st->tx - 2));
+		if (st->x > 1 && st->cmd.len) {
+			str_removechar(&st->cmd, (size_t)(st->x - 2));
 			term_printf(0, st->h - 1, COLOR_DEFAULT,
 					":%s", st->cmd.s);
-			term_set_cursor(--st->tx, st->h - 1);
+			term_set_cursor(--st->x, st->h - 1);
 		}
 		break;
 	case KEY_DELETE:
@@ -1367,21 +1370,21 @@ key_command_line(struct state *st)
 		 * text on the current row
 		 */
 		if (st->cmd.len) {
-			str_removechar(&st->cmd, (size_t)(st->tx - 1));
+			str_removechar(&st->cmd, (size_t)(st->x - 1));
 			term_printf(0, st->h - 1, COLOR_DEFAULT,
 					":%s", st->cmd.s);
-			term_set_cursor(st->tx, st->h - 1);
+			term_set_cursor(st->x, st->h - 1);
 		}
 		break;
 	case KEY_CHAR:
 		/* regular key */
-		if (st->tx > 0 && st->tx < st->w - 1) {
+		if (st->x > 0 && st->x < st->w - 1) {
 			str_insertchar(&st->cmd, st->ev.ch,
-					(size_t)(st->tx - 1),
+					(size_t)(st->x - 1),
 					CMD_SIZE_INCREMENT);
 			term_printf(0, st->h - 1, COLOR_DEFAULT,
 					":%s", st->cmd.s);
-			term_set_cursor(++st->tx, st->h - 1);
+			term_set_cursor(++st->x, st->h - 1);
 		}
 		break;
 	default:
@@ -1398,7 +1401,7 @@ key_insert(struct state *st)
 		/* go into normal mode */
 		st->mode = MODE_NORMAL;
 		term_clear_row(st->h - 1);
-		term_set_cursor(st->tx, st->ty);
+		term_set_cursor(st->x, st->ty);
 		break;
 	case KEY_ARROW_UP:
 		cursor_up(st);
@@ -1426,10 +1429,9 @@ key_insert(struct state *st)
 			st->modified = 1;
 			buf_char_remove(&st->buf, (size_t)st->y,
 					(size_t)--st->x);
-			--st->tx;
 			term_print(0, st->ty, COLOR_DEFAULT,
 					st->buf.b[st->y]->s);
-			term_set_cursor(st->tx, st->ty);
+			term_set_cursor(st->x, st->ty);
 		}
 		break;
 	case KEY_DELETE:
@@ -1443,7 +1445,7 @@ key_insert(struct state *st)
 					(size_t)st->x);
 			term_print(0, st->ty, COLOR_DEFAULT,
 					st->buf.b[st->y]->s);
-			term_set_cursor(st->tx, st->ty);
+			term_set_cursor(st->x, st->ty);
 		}
 		break;
 	case KEY_CHAR:
@@ -1454,8 +1456,7 @@ key_insert(struct state *st)
 					(size_t)st->x);
 			term_print(0, st->ty, COLOR_DEFAULT,
 					st->buf.b[st->y]->s);
-			++st->x;
-			term_set_cursor(++st->tx, st->ty);
+			term_set_cursor(++st->x, st->ty);
 		}
 		break;
 	default:
@@ -1490,6 +1491,11 @@ key_normal(struct state *st)
 		else
 			cursor_left(st);
 		break;
+	case KEY_CTRL:
+		if (st->ev.ch == 'L')
+			/* clear and redraw screen */
+			resized(st);
+		break;
 	case KEY_CHAR:
 		switch (st->ev.ch) {
 		case 'h':
@@ -1519,11 +1525,10 @@ key_normal(struct state *st)
 			break;
 		case ':':
 			st->mode = MODE_COMMAND_LINE;
-			st->storedtx = st->tx;
-			st->tx = 1;
-			term_print(0, st->h - 1, COLOR_DEFAULT,
-					":");
-			term_set_cursor(st->tx, st->h - 1);
+			st->storedx = st->x;
+			st->x = 1;
+			term_print(0, st->h - 1, COLOR_DEFAULT, ":");
+			term_set_cursor(st->x, st->h - 1);
 			break;
 		}
 	default:
@@ -1531,6 +1536,38 @@ key_normal(struct state *st)
 	}
 }
 
+static void
+resized(struct state *st)
+{
+	/* fetch new terminal size */
+	if (term_size(&st->w, &st->h) < 0) {
+		st->w = FALLBACK_WIDTH;
+		st->h = FALLBACK_HEIGHT;
+	}
+	if (st->h < 2)
+		die("terminal height too low");
+
+	/* clear and redraw screen */
+	write(STDOUT_FILENO, "\033[2J", 4);
+	redraw(st, (st->y > st->h - 2) ? st->y - (st->h - 2) : 0,
+			0, st->h - 2);
+
+	/* set new cursor position on-screen correctly */
+	if (st->x > st->w - 2)
+		st->x = st->w - 2;
+
+	if (st->ty < st->y && st->y <= st->h - 2)
+		st->ty = st->y;
+	else if (st->y > st->h - 2)
+		st->ty = st->h - 2;
+
+	term_set_cursor(st->x, st->ty);
+}
+
+/*
+ * ============================================================================
+ * main program loop
+ */
 static void
 run(int argc, char *argv[])
 {
@@ -1545,7 +1582,7 @@ run(int argc, char *argv[])
 	st.cmd.len = 0;
 	st.cmd.size = INITIAL_ROW_SIZE;
 
-	st.x = st.y = st.tx = st.ty = st.storedtx = 0;
+	st.x = st.y = st.ty = st.storedx = 0;
 	st.mode = MODE_NORMAL;
 	st.name = (argc > 1) ? argv[1] : NULL;
 	st.name_needs_free = st.modified = st.written = st.done = 0;
@@ -1568,25 +1605,7 @@ run(int argc, char *argv[])
 		switch (st.ev.type) {
 #if ENABLE_NONPOSIX && defined(SIGWINCH)
 		case TERM_EVENT_RESIZE:
-			if (term_size(&st.w, &st.h) < 0) {
-				st.w = FALLBACK_WIDTH;
-				st.h = FALLBACK_HEIGHT;
-			}
-			if (st.h < 2)
-				die("terminal height too low");
-
-			term_set_cursor(st.tx, st.ty);
-
-			/*
-			 * check if current cursor position is now
-			 * outside the window, might happen if it
-			 * was resized to be smaller
-			 */
-			if (st.x >= st.w - 1)
-				st.x = st.w - 1;
-			if (st.y >= st.h - 1)
-				st.y = st.h - 1;
-
+			resized(&st);
 			break;
 #endif /* ENABLE_NONPOSIX && defined(SIGWINCH) */
 		case TERM_EVENT_KEY:
