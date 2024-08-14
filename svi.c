@@ -27,16 +27,17 @@
 
 /*
  * TODO (from highest to lowest priority):
- * - opening files
- * - rendering of long lines (line-wrap)
- * - write data to file when exiting due to error
+ * - fix memory leak when opening a file
+ * - make backspace be able to remove lines
+ * - handle tabs properly
+ * - horizontal scrolling for long lines
  * - add support for more movement keys
  * - use select() in try_read_char to allow parsing of cursor key sequences
  *   if there's a delay between the characters
+ * - optimize memory usage on large files
  * - scrolling the screen up redraws the whole screen; is there a more
  *   efficient way to do this?
  * - optimize certain movements to use less escape sequences
- * - optimize memory usage on large files
  * - UTF-8 support
  * - maybe try to handle OOM more gracefully instead of exiting instantly
  */
@@ -84,13 +85,25 @@
  * editing buffer
  */
 
-/* how many rows to initially allocate for the buffer, cant be 0 */
+/* how many rows to initially allocate for an empty buffer, cant be 0 */
 #define INITIAL_BUFFER_ROWS 32
 
-/* how many rows to add to the buffer's size when it's too small, cant be 0 */
+/* how many rows to add to a buffer's size when it's too small, cant be 0 */
 #define BUF_SIZE_INCREMENT  16
 
-/* how many columns to initially allocate for each row, cant be 0 or 1 */
+/* same as INITIAL_BUFFER_ROWS, but for buffers created from files */
+#define FILE_BUFFER_ROWS    128
+
+/*
+ * amount of rows to add from a buffer being created from a file that's too
+ * small to fit more rows from the file
+ */
+#define FILE_BUF_SIZE_INCR  256
+
+/*
+ * how many columns to initially allocate for each row in an empty buffer,
+ * cant be 0 or 1
+ */
 #define INITIAL_ROW_SIZE    128
 
 /* how many columns to add to a row's size when it's too small, cant be 0 */
@@ -302,6 +315,9 @@ static void buf_free(const struct buf *buf);
 static void buf_resize(struct buf *buf, size_t size);
 static void buf_shift_down(struct buf *buf, size_t start_index,
 		size_t size_increment);
+
+/* buffer file operations */
+static int buf_from_file(struct buf *buf, const char *filename);
 static int buf_write(const struct buf *buf, const char *filename,
 		int overwrite);
 static int iov_write(struct iovec *iov, int *iovcnt, size_t iov_size,
@@ -809,15 +825,14 @@ str_removechar(struct str *str, size_t index)
 	if (str->len - 1 == index) {
 		/* if we need to remove at the end, just do that */
 		str->s[index] = '\0';
-		--str->len;
 	} else {
 		/*
 		 * if we need to remove elsewhere, shift the portion
 		 * of the string beginning from (index + 1) backwards
 		 */
 		memmove(str->s + index, str->s + index + 1, str->len - index);
-		--str->len;
 	}
+	--str->len;
 }
 
 /*
@@ -943,6 +958,48 @@ buf_shift_down(struct buf *buf, size_t start_index, size_t size_increment)
 	memmove(&buf->b[start_index + 1], &buf->b[start_index],
 			(buf->len - start_index) * sizeof(struct str *));
 	++buf->len;
+}
+
+/*
+ * ============================================================================
+ * buffer file operations
+ */
+static int
+buf_from_file(struct buf *buf, const char *filename)
+{
+	/* create a buffer and read the contents of a file into it */
+	size_t elem = 0;
+	FILE *f = fopen(filename, "r");
+	if (!f)
+		return -1;
+
+	buf_create(buf, FILE_BUFFER_ROWS);
+
+	for (errno = 0; ; ++elem) {
+		if (elem >= buf->size) {
+			size_t newsize = elem;
+			if (newsize % FILE_BUF_SIZE_INCR == 0)
+				++newsize;
+			buf_resize(buf, ROUNDUPTO(newsize,
+						FILE_BUF_SIZE_INCR));
+		}
+		buf->b[elem] = emalloc(sizeof(struct str));
+		buf->b[elem]->s = NULL;
+		buf->b[elem]->size = 0;
+		if (getline(&buf->b[elem]->s, &buf->b[elem]->size, f) < 0) {
+			if (errno)
+				die("getline:");
+			else
+				break;
+		}
+		buf->b[elem]->len = strlen(buf->b[elem]->s);
+		if (buf->b[elem]->len && buf->b[elem]->s[
+				buf->b[elem]->len - 1] == '\n')
+			buf->b[elem]->s[--buf->b[elem]->len] = '\0';
+	}
+	buf->len = elem;
+	fclose(f);
+	return 0;
 }
 
 static int
@@ -1269,14 +1326,15 @@ insert_newline(struct state *st)
 		redraw(st, st->y, st->ty, st->h - 2);
 	} else if ((size_t)st->y < st->buf.len - 1) {
 		/*
-		 * there is no text on this row, but there is
-		 * text after this row
+		 * there is text after this row and we're either
+		 * at the end of the row or this row is empty
 		 */
-		buf_shift_down(&st->buf, (size_t)st->y, BUF_SIZE_INCREMENT);
-		st->buf.b[st->y] = NULL;
+		buf_shift_down(&st->buf, (size_t)(st->y + 1),
+				BUF_SIZE_INCREMENT);
+		st->buf.b[st->y + 1] = NULL;
 
 		/* redraw screen */
-		redraw(st, st->y, st->ty, st->h - 2);
+		redraw(st, st->y + 1, st->ty + 1, st->h - 2);
 	} else {
 		/* there's no text after this row */
 		++st->buf.len;
@@ -1575,7 +1633,12 @@ run(int argc, char *argv[])
 	struct state st;
 
 	/* initialize state */
-	buf_create(&st.buf, INITIAL_BUFFER_ROWS);
+	if (argc > 1 && access(argv[1], F_OK) == 0)
+		/* file already exists, open it */
+		buf_from_file(&st.buf, argv[1]);
+	else
+		/* file not specified or doesn't exist */
+		buf_create(&st.buf, INITIAL_BUFFER_ROWS);
 
 	st.cmd.s = emalloc(INITIAL_CMD_SIZE);
 	st.cmd.s[0] = '\0';
