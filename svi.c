@@ -27,7 +27,6 @@
 
 /*
  * TODO (from highest to lowest priority):
- * - fix memory leak when opening a file
  * - make backspace be able to remove lines
  * - handle tabs properly
  * - horizontal scrolling for long lines
@@ -968,7 +967,8 @@ static int
 buf_from_file(struct buf *buf, const char *filename)
 {
 	/* create a buffer and read the contents of a file into it */
-	size_t elem = 0;
+	char *s;
+	size_t l, n, elem = 0;
 	FILE *f = fopen(filename, "r");
 	if (!f)
 		return -1;
@@ -983,19 +983,23 @@ buf_from_file(struct buf *buf, const char *filename)
 			buf_resize(buf, ROUNDUPTO(newsize,
 						FILE_BUF_SIZE_INCR));
 		}
-		buf->b[elem] = emalloc(sizeof(struct str));
-		buf->b[elem]->s = NULL;
-		buf->b[elem]->size = 0;
-		if (getline(&buf->b[elem]->s, &buf->b[elem]->size, f) < 0) {
-			if (errno)
+		s = NULL;
+		n = 0;
+		if (getline(&s, &n, f) < 0) {
+			if (errno) {
+				fclose(f);
 				die("getline:");
-			else
+			} else {
 				break;
+			}
 		}
-		buf->b[elem]->len = strlen(buf->b[elem]->s);
-		if (buf->b[elem]->len && buf->b[elem]->s[
-				buf->b[elem]->len - 1] == '\n')
-			buf->b[elem]->s[--buf->b[elem]->len] = '\0';
+		l = strlen(s);
+		if (l && s[l - 1] == '\n')
+			s[--l] = '\0';
+		buf->b[elem] = emalloc(sizeof(struct str));
+		buf->b[elem]->s = s;
+		buf->b[elem]->size = n;
+		buf->b[elem]->len = l;
 	}
 	buf->len = elem;
 	fclose(f);
