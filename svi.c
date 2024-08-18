@@ -26,13 +26,15 @@
  */
 
 /*
- * TODO (from highest to lowest priority):
- * - make backspace be able to remove lines
+ * todo (from highest to lowest priority):
+ * - clean up codebase, shorten some long lines
  * - handle tabs properly
  * - horizontal scrolling for long lines
  * - add support for more movement keys
  * - use select() in try_read_char to allow parsing of cursor key sequences
  *   if there's a delay between the characters
+ * - fix inconsistent coding style; decide on whether 'if (x)' or 'if (x > 0)'
+ *   should be used, aswell as 'if (x == 0)' and 'if (!x)'
  * - optimize memory usage on large files
  * - scrolling the screen up redraws the whole screen; is there a more
  *   efficient way to do this?
@@ -84,10 +86,10 @@
  * editing buffer
  */
 
-/* how many rows to initially allocate for an empty buffer, cant be 0 */
+/* how many rows to initially allocate for an empty buffer, can't be 0 */
 #define INITIAL_BUFFER_ROWS 32
 
-/* how many rows to add to a buffer's size when it's too small, cant be 0 */
+/* how many rows to add to a buffer's size when it's too small, can't be 0 */
 #define BUF_SIZE_INCREMENT  16
 
 /* same as INITIAL_BUFFER_ROWS, but for buffers created from files */
@@ -95,17 +97,20 @@
 
 /*
  * amount of rows to add from a buffer being created from a file that's too
- * small to fit more rows from the file
+ * small to fit more rows from the file, can't be 0
  */
 #define FILE_BUF_SIZE_INCR  256
 
 /*
  * how many columns to initially allocate for each row in an empty buffer,
- * cant be 0 or 1
+ * can't be 0 or 1
  */
 #define INITIAL_ROW_SIZE    128
 
-/* how many columns to add to a row's size when it's too small, cant be 0 */
+/*
+ * how many columns to add to a row's size when it's too small,
+ * can't be 0 or 1
+ */
 #define ROW_SIZE_INCREMENT  64
 
 /*
@@ -126,13 +131,13 @@
 
 /*
  * how many characters to initially allocate for the command
- * buffer, cant be 0
+ * buffer, can't be 0
  */
 #define INITIAL_CMD_SIZE    16
 
 /*
  * how many characters to add to the command buffer's size when it's too
- * small, cant be 0
+ * small, can't be 0
  */
 #define CMD_SIZE_INCREMENT  16
 
@@ -314,6 +319,7 @@ static void buf_free(const struct buf *buf);
 static void buf_resize(struct buf *buf, size_t size);
 static void buf_shift_down(struct buf *buf, size_t start_index,
 		size_t size_increment);
+static void buf_shift_up(struct buf *buf, size_t start_index);
 
 /* buffer file operations */
 static int buf_from_file(struct buf *buf, const char *filename);
@@ -341,6 +347,7 @@ static int exec_cmd(struct state *st);
 static void insert_newline(struct state *st);
 static void redraw(struct state *st, int start_y, int start_ty, int end_ty);
 static void redraw_row(struct state *st, int y, int ty);
+static void remove_newline(struct state *st);
 
 /* event handling */
 static void key_command_line(struct state *st);
@@ -401,7 +408,7 @@ static void *
 ereallocarray(void *ptr, size_t nmemb, size_t size)
 {
 	/* overflow checking taken from musl's calloc implementation */
-	if (size > 0 && nmemb > SIZE_MAX / size) {
+	if (size && nmemb > SIZE_MAX / size) {
 		errno = ENOMEM;
 		die("reallocarray: out of memory");
 	}
@@ -949,7 +956,7 @@ buf_shift_down(struct buf *buf, size_t start_index, size_t size_increment)
 	 * if the buffer is too small, its size is increased by
 	 * size_increment elements.
 	 *
-	 * the newly created element has an unspecified value.
+	 * the newly created element has an undefined value.
 	 */
 	if (buf->len + 1 > buf->size)
 		buf_resize(buf, buf->size + size_increment);
@@ -957,6 +964,22 @@ buf_shift_down(struct buf *buf, size_t start_index, size_t size_increment)
 	memmove(&buf->b[start_index + 1], &buf->b[start_index],
 			(buf->len - start_index) * sizeof(struct str *));
 	++buf->len;
+}
+
+static void
+buf_shift_up(struct buf *buf, size_t start_index)
+{
+	/*
+	 * shift every element of a buffer starting from the index
+	 * start_index (included) upwards by 1 element.
+	 *
+	 * the element at (start_index - 1) is overwritten.
+	 * the previously last element now has a value of NULL.
+	 * if start_index is 0, the behaviour is the same as if it was 1.
+	 */
+	memmove(&buf->b[start_index - 1], &buf->b[start_index],
+			(buf->len - start_index) * sizeof(struct str *));
+	buf->b[--buf->len] = NULL;
 }
 
 /*
@@ -1068,11 +1091,11 @@ iov_write(struct iovec *iov, int *iovcnt, size_t iov_size, int writefd,
 static void
 cursor_up(struct state *st)
 {
-	if (st->y > 0) {
+	if (st->y) {
 		size_t elen = buf_elem_len(&st->buf, (size_t)--st->y);
 		if ((size_t)st->x > elen)
 			st->x = (int)elen;
-		if (st->ty > 0)
+		if (st->ty)
 			--st->ty;
 		else
 			redraw(st, st->y, 0, st->h - 2);
@@ -1109,7 +1132,7 @@ cursor_right(struct state *st)
 static void
 cursor_left(struct state *st)
 {
-	if (st->x > 0)
+	if (st->x)
 		term_set_cursor(--st->x, st->ty);
 }
 
@@ -1153,9 +1176,9 @@ cursor_startnextrow(struct state *st, int stripextranewline)
 static void
 cursor_endpreviousrow(struct state *st)
 {
-	if (st->y > 0) {
+	if (st->y) {
 		st->x = (int)buf_elem_len(&st->buf, (size_t)--st->y);
-		if (st->ty > 0)
+		if (st->ty)
 			--st->ty;
 		else
 			redraw(st, st->y, 0, st->h - 2);
@@ -1302,7 +1325,10 @@ insert_newline(struct state *st)
 		size_t newlen = st->buf.b[st->y]->len - (size_t)st->x;
 
 		/* size of new row */
-		size_t newsize = ROUNDUPTO(newlen, ROW_SIZE_INCREMENT);
+		size_t newsize = newlen;
+		if (newsize % ROW_SIZE_INCREMENT == 0)
+			++newsize;
+		newsize = ROUNDUPTO(newsize, ROW_SIZE_INCREMENT);
 
 		/* shift down all rows below cursor */
 		buf_shift_down(&st->buf, (size_t)(st->y + 1),
@@ -1374,6 +1400,67 @@ redraw_row(struct state *st, int y, int ty)
 	}
 }
 
+static void
+remove_newline(struct state *st)
+{
+	/* we can assume that (st->x == 0 && st->y) */
+	if (BUF_ELEM_NOTEMPTY(st->buf, st->y) && BUF_ELEM_NOTEMPTY(st->buf,
+				st->y - 1)) {
+		/* stick the current row to the end of the previous row */
+		size_t oldlen = st->buf.b[st->y - 1]->len;
+		size_t newlen = oldlen + st->buf.b[st->y]->len;
+
+		if (newlen >= st->buf.b[st->y - 1]->size) {
+			/* if the row above is too small, increase its size */
+			size_t newsize = newlen;
+			if (newsize % ROW_SIZE_INCREMENT == 0)
+				++newsize;
+			st->buf.b[st->y - 1]->size = ROUNDUPTO(newsize,
+					ROW_SIZE_INCREMENT);
+			st->buf.b[st->y - 1]->s = erealloc(
+					st->buf.b[st->y - 1]->s,
+					st->buf.b[st->y - 1]->size);
+		}
+		memcpy(st->buf.b[st->y - 1]->s + oldlen,
+				st->buf.b[st->y]->s,
+				st->buf.b[st->y]->len + 1);
+		st->buf.b[st->y - 1]->len = newlen;
+		if (st->buf.b[st->y]) {
+			free(st->buf.b[st->y]->s);
+			free(st->buf.b[st->y]);
+		}
+		st->x = (int)oldlen;
+		buf_shift_up(&st->buf, (size_t)(st->y + 1));
+	} else if (BUF_ELEM_NOTEMPTY(st->buf, st->y - 1)) {
+		/*
+		 * this row is empty
+		 * the row above is not empty
+		 */
+		if (st->buf.b[st->y]) {
+			free(st->buf.b[st->y]->s);
+			free(st->buf.b[st->y]);
+		}
+		st->x = (int)st->buf.b[st->y - 1]->len;
+		buf_shift_up(&st->buf, (size_t)(st->y + 1));
+	} else {
+		/*
+		 * this row is not empty
+		 * the row above is empty
+		 */
+		if (st->buf.b[st->y - 1]) {
+			free(st->buf.b[st->y - 1]->s);
+			free(st->buf.b[st->y - 1]);
+		}
+		buf_shift_up(&st->buf, (size_t)st->y);
+	}
+
+	/* don't call cursor_endpreviousrow() to avoid double redraws */
+	if (st->ty)
+		--st->ty;
+	redraw(st, --st->y, st->ty, st->h - 2);
+	term_set_cursor(st->x, st->ty);
+}
+
 /*
  * ============================================================================
  * event handling
@@ -1440,7 +1527,7 @@ key_command_line(struct state *st)
 		break;
 	case KEY_CHAR:
 		/* regular key */
-		if (st->x > 0 && st->x < st->w - 1) {
+		if (st->x && st->x < st->w - 1) {
 			str_insertchar(&st->cmd, st->ev.ch,
 					(size_t)(st->x - 1),
 					CMD_SIZE_INCREMENT);
@@ -1487,13 +1574,16 @@ key_insert(struct state *st)
 		 * at the beginning of the row and there's
 		 * some text on the current row
 		 */
-		if (st->x > 0 && BUF_ELEM_NOTEMPTY(st->buf, st->y)) {
+		if (st->x && BUF_ELEM_NOTEMPTY(st->buf, st->y)) {
 			st->modified = 1;
 			buf_char_remove(&st->buf, (size_t)st->y,
 					(size_t)--st->x);
 			term_print(0, st->ty, COLOR_DEFAULT,
 					st->buf.b[st->y]->s);
 			term_set_cursor(st->x, st->ty);
+		} else if (st->x == 0 && st->y) {
+			st->modified = 1;
+			remove_newline(st);
 		}
 		break;
 	case KEY_DELETE:
@@ -1548,7 +1638,7 @@ key_normal(struct state *st)
 		break;
 	case KEY_BACKSPACE:
 		/* move to previous char */
-		if (st->x == 0 && st->y > 0)
+		if (st->x == 0 && st->y)
 			cursor_endpreviousrow(st);
 		else
 			cursor_left(st);
