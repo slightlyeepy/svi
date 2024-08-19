@@ -143,9 +143,11 @@
 
 /*
  * ============================================================================
- * compatibility with certain platforms
+ * includes
  */
+#define _XOPEN_SOURCE 700
 
+/* compatibility with certain platforms */
 #if ENABLE_NONPOSIX
 #include <sys/param.h>
 
@@ -162,17 +164,13 @@
 typedef uint64_t __u64;
 #endif /* defined(__dietlibc__) && defined(__x86_64__) */
 
-/*
- * ============================================================================
- * includes
- */
-#define _XOPEN_SOURCE 700
 #if ENABLE_NONPOSIX
 #include <sys/ioctl.h>
 #endif /* ENABLE_NONPOSIX */
 #include <sys/select.h>
 #include <sys/uio.h>
 
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #if ENABLE_NONPOSIX
@@ -331,11 +329,13 @@ static int iov_write(struct iovec *iov, int *iovcnt, size_t iov_size,
 /* movement */
 static void cursor_up(struct state *st);
 static void cursor_down(struct state *st);
-static void cursor_right(struct state *st);
+static void cursor_right(struct state *st, int stopatlastchar);
 static void cursor_left(struct state *st);
 static void cursor_linestart(struct state *st);
-static void cursor_lineend(struct state *st);
+static void cursor_lineend(struct state *st, int stopbeforelastchar);
 static void cursor_startnextrow(struct state *st, int stripextranewline);
+static void cursor_endpreviousrow(struct state *st);
+static void cursor_nonblank(struct state *st);
 
 /* commands */
 static const char *cmdarg(const char *cmd);
@@ -1122,10 +1122,12 @@ cursor_down(struct state *st)
 }
 
 static void
-cursor_right(struct state *st)
+cursor_right(struct state *st, int stopatlastchar)
 {
-	if (st->x < st->w - 1 && (size_t)st->x < buf_elem_len(&st->buf,
-				(size_t)st->y))
+	size_t l = buf_elem_len(&st->buf, (size_t)st->y);
+	if (stopatlastchar)
+		--l;
+	if (st->x < st->w - 1 && (size_t)st->x < l)
 		term_set_cursor(++st->x, st->ty);
 }
 
@@ -1144,12 +1146,11 @@ cursor_linestart(struct state *st)
 }
 
 static void
-cursor_lineend(struct state *st)
+cursor_lineend(struct state *st, int stopbeforelastchar)
 {
-	size_t l = buf_elem_len(&st->buf, (size_t)st->y);
-	if (l)
-		--l;
-	st->x = (int)l;
+	st->x = (int)buf_elem_len(&st->buf, (size_t)st->y);
+	if (stopbeforelastchar && st->x)
+		--st->x;
 	term_set_cursor(st->x, st->ty);
 }
 
@@ -1182,6 +1183,20 @@ cursor_endpreviousrow(struct state *st)
 			--st->ty;
 		else
 			redraw(st, st->y, 0, st->h - 2);
+		term_set_cursor(st->x, st->ty);
+	}
+}
+
+static void
+cursor_nonblank(struct state *st)
+{
+	if (BUF_ELEM_NOTEMPTY(st->buf, st->y)) {
+		size_t l = st->buf.b[st->y]->len;
+		for (st->x = 0; st->x < (int)l; ++st->x)
+			if (!isblank(st->buf.b[st->y]->s[st->x]))
+				break;
+		if (st->x == (int)l)
+			--st->x;
 		term_set_cursor(st->x, st->ty);
 	}
 }
@@ -1559,7 +1574,7 @@ key_insert(struct state *st)
 		cursor_down(st);
 		break;
 	case KEY_ARROW_RIGHT:
-		cursor_right(st);
+		cursor_right(st, 1);
 		break;
 	case KEY_ARROW_LEFT:
 		cursor_left(st);
@@ -1628,7 +1643,7 @@ key_normal(struct state *st)
 		cursor_down(st);
 		break;
 	case KEY_ARROW_RIGHT:
-		cursor_right(st);
+		cursor_right(st, 1);
 		break;
 	case KEY_ARROW_LEFT:
 		cursor_left(st);
@@ -1660,19 +1675,42 @@ key_normal(struct state *st)
 			cursor_up(st);
 			break;
 		case 'l':
-			cursor_right(st);
+			cursor_right(st, 1);
 			break;
 		case '0':
 			cursor_linestart(st);
 			break;
 		case '$':
-			cursor_lineend(st);
+			cursor_lineend(st, 1);
+			break;
+		case '^':
+			cursor_nonblank(st);
 			break;
 		case 'i':
 			st->mode = MODE_INSERT;
 			break;
+		case 'I':
+			cursor_linestart(st);
+			st->mode = MODE_INSERT;
+			break;
 		case 'a':
-			cursor_right(st);
+			cursor_right(st, 0);
+			st->mode = MODE_INSERT;
+			break;
+		case 'A':
+			cursor_lineend(st, 0);
+			st->mode = MODE_INSERT;
+			break;
+		case 'o':
+			cursor_lineend(st, 0);
+			st->modified = 1;
+			insert_newline(st);
+			st->mode = MODE_INSERT;
+			break;
+		case 'O':
+			cursor_endpreviousrow(st);
+			st->modified = 1;
+			insert_newline(st);
 			st->mode = MODE_INSERT;
 			break;
 		case ':':
@@ -1793,7 +1831,7 @@ main(int argc, char *argv[])
 		argv0 = argv[0];
 
 #if ENABLE_PLEDGE
-        if (pledge("stdio rpath wpath cpath tty", NULL) < 0)
+	if (pledge("stdio rpath wpath cpath tty", NULL) < 0)
 		die("pledge:");
 #endif /* ENABLE_PLEDGE */
 
