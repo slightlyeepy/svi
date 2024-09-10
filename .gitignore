@@ -1,5 +1,5 @@
 # debugging stuff that isnt part of the program
-*.log
+*log*
 
 # compilation products
 svi

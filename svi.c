@@ -917,7 +917,7 @@ row_removechar(struct row *row, size_t index)
 	 * NOTE: might cause an integer underflow if there's a bug that
 	 * i didn't notice but i think it's fine
 	 */
-	if (c == '\t') 
+	if (c == '\t')
 		--row->tabs;
 }
 
@@ -947,7 +947,10 @@ buf_char_insert(struct buf *buf, size_t elem, char c, size_t index)
 		buf->b[elem]->s[1] = '\0';
 		buf->b[elem]->len = 1;
 		buf->b[elem]->size = INITIAL_ROW_SIZE;
-		buf->b[elem]->tabs = 0;
+		if (c == '\t')
+			buf->b[elem]->tabs = 1;
+		else
+			buf->b[elem]->tabs = 0;
 	} else {
 		row_insertchar(buf->b[elem], c, index, ROW_SIZE_INCREMENT);
 	}
