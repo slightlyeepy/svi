@@ -30,7 +30,6 @@
  * - clean up codebase, shorten some long lines
  * - add support for scrolling up/down whole pages
  * - add support for <count><movement> (e.g 5j to move down 5 rows)
- * - handle tabs properly
  * - horizontal scrolling for long lines
  * - add support for more movement keys
  * - fix inconsistent coding style; decide on whether 'if (x)' or 'if (x > 0)'
@@ -53,6 +52,13 @@
  * general
  */
 
+/* tab width in columns */
+#define TAB_WIDTH       8
+#define TAB_WIDTH_CHARS "        "
+
+/* mode for newly created files; will be modified by the process's umask(2) */
+#define NEW_FILE_MODE   0666
+
 /*
  * enable usage of non-POSIX/XSI but very common features (sys/ioctl.h,
  * sys/param.h, ioctl, TIOCGWINSZ, and SIGWINCH).
@@ -62,9 +68,6 @@
 
 /* enable usage of OpenBSD's pledge(2). 0 = false, 1 = true */
 #define ENABLE_PLEDGE   0
-
-/* mode for newly created files; will be modified by the process's umask(2) */
-#define NEW_FILE_MODE   0666
 
 /*
  * ===================
@@ -238,6 +241,9 @@ enum key {
 	KEY_BACKSPACE,
 	KEY_ENTER,
 
+	/* tab */
+	KEY_TAB,
+
 	/* ctrl+<key> / regular key */
 	KEY_CTRL,
 	KEY_CHAR
@@ -256,26 +262,27 @@ struct term_event {
 	char ch;
 };
 
-struct str {
+struct row {
 	char *s;
 	size_t len, size;
+	size_t tabs;
 };
 
 struct buf {
-	struct str **b;
+	struct row **b;
 	size_t len, size;
 };
 
 struct state {
 	struct buf buf; /* the main buffer */
-	struct str cmd; /* string used to hold commands */
+	struct row cmd; /* string used to hold commands */
 
 	int w, h; /* window dimensions */
 	int x, y; /* cursor's current position in the editing buffer */
-	int ty; /* cursor's current Y position on-screen */
+	int tx, ty; /* cursor's current position on-screen */
 
 	enum mode mode; /* current mode */
-	int storedx; /* value of x before entering command-line mode */
+	int storedtx; /* value of tx before entering command-line mode */
 
 	char *name; /* name of file being edited */
 	int name_needs_free; /* whether name should be free()'d */
@@ -317,9 +324,12 @@ static void winch(int unused);
 #endif /* ENABLE_NONPOSIX && defined(SIGWINCH) */
 
 /* strings */
-static void str_insertchar(struct str *str, char c, size_t index,
+static size_t count_tabs(const char *s, size_t l);
+
+/* rows */
+static void row_insertchar(struct row *row, char c, size_t index,
 		size_t size_increment);
-static void str_removechar(struct str *str, size_t index);
+static void row_removechar(struct row *row, size_t index);
 
 /* buffer management */
 static void buf_char_insert(struct buf *buf, size_t elem, char c,
@@ -341,6 +351,7 @@ static int iov_write(struct iovec *iov, int *iovcnt, size_t iov_size,
 		int writefd, char *str, size_t len);
 
 /* movement */
+static void cursor_fix_xpos(struct state *st);
 static void cursor_up(struct state *st);
 static void cursor_down(struct state *st);
 static void cursor_right(struct state *st, int stopatlastchar);
@@ -547,6 +558,10 @@ readkey(struct term_event *ev)
 		case '\r':
 			/* carriage return = enter */
 			ev->key = KEY_ENTER;
+			return;
+		case '\011':
+			/* <ht>, horizontal tab */
+			ev->key = KEY_TAB;
 			return;
 		default:
 			if (c < 0x20) {
@@ -821,62 +836,89 @@ winch(int unused)
  * ============================================================================
  * strings
  */
+static size_t
+count_tabs(const char *s, size_t l)
+{
+	size_t tabs = 0;
+	size_t i = 0;
+	for (; i < l; ++i)
+		if (s[i] == '\t')
+			++tabs;
+	return tabs;
+}
+
+/*
+ * ============================================================================
+ * rows
+ */
 static void
-str_insertchar(struct str *str, char c, size_t index, size_t size_increment)
+row_insertchar(struct row *row, char c, size_t index, size_t size_increment)
 {
 	/*
-	 * insert the character c into the string str at the index index.
+	 * insert the character c into a row at the index index.
 	 * if the string is too small to hold the extra character,
 	 * increase its size by size_increment.
 	 */
-	if (str->len + 1 >= str->size) {
-		/* if the string is too small, increase its size */
-		str->size += size_increment;
-		str->s = erealloc(str->s, str->size);
+	if (row->len + 1 >= row->size) {
+		/* if the rowing is too small, increase its size */
+		row->size += size_increment;
+		row->s = erealloc(row->s, row->size);
 	}
 
-	if (index > str->len)
-		index = str->len;
+	if (index > row->len)
+		index = row->len;
 
-	if (str->len == index) {
+	if (row->len == index) {
 		/* if we need to insert at the end, simply do that */
-		str->s[index] = c;
-		str->s[index + 1] = '\0';
-		++str->len;
+		row->s[index] = c;
+		row->s[index + 1] = '\0';
+		++row->len;
 	} else {
 		/*
 		 * if we need to insert elsewhere, move the portion
-		 * of the string beginning from the index forwards
+		 * of the rowing beginning from the index forwards
 		 * to make room for the character
 		 */
-		memmove(str->s + index + 1, str->s + index,
-				str->len - index + 1);
-		str->s[index] = c;
-		++str->len;
+		memmove(row->s + index + 1, row->s + index,
+				row->len - index + 1);
+		row->s[index] = c;
+		++row->len;
 	}
+
+	if (c == '\t')
+		++row->tabs;
 }
 
 static void
-str_removechar(struct str *str, size_t index)
+row_removechar(struct row *row, size_t index)
 {
-	/* remove the character located at index index from the string str. */
-	if (str->len == 0)
+	/* remove the character located at index index from a row. */
+	char c;
+	if (row->len == 0)
 		return;
 
-	if (index > str->len)
-		index = str->len;
+	if (index > row->len)
+		index = row->len;
 
-	if (str->len - 1 == index) {
+	c = row->s[index];
+	if (row->len - 1 == index) {
 		/* if we need to remove at the end, just do that */
-		str->s[index] = '\0';
+		row->s[index] = '\0';
 	} else {
 		/*
 		 * if we need to remove elsewhere, shift the portion
 		 * of the string beginning from (index + 1) backwards
 		 */
-		memmove(str->s + index, str->s + index + 1, str->len - index);
+		memmove(row->s + index, row->s + index + 1, row->len - index);
 	}
-	--str->len;
+	--row->len;
+
+	/*
+	 * NOTE: might cause an integer underflow if there's a bug that
+	 * i didn't notice but i think it's fine
+	 */
+	if (c == '\t') 
+		--row->tabs;
 }
 
 /*
@@ -899,14 +941,15 @@ buf_char_insert(struct buf *buf, size_t elem, char c, size_t index)
 	if (elem >= buf->len)
 		buf->len = elem + 1;
 	if (!buf->b[elem]) {
-		buf->b[elem] = emalloc(sizeof(struct str));
+		buf->b[elem] = emalloc(sizeof(struct row));
 		buf->b[elem]->s = emalloc(INITIAL_ROW_SIZE);
 		buf->b[elem]->s[0] = c;
 		buf->b[elem]->s[1] = '\0';
 		buf->b[elem]->len = 1;
 		buf->b[elem]->size = INITIAL_ROW_SIZE;
+		buf->b[elem]->tabs = 0;
 	} else {
-		str_insertchar(buf->b[elem], c, index, ROW_SIZE_INCREMENT);
+		row_insertchar(buf->b[elem], c, index, ROW_SIZE_INCREMENT);
 	}
 }
 
@@ -915,14 +958,14 @@ buf_char_remove(struct buf *buf, size_t elem, size_t index)
 {
 	/* remove a character from a specific element of a buffer. */
 	if (elem < buf->size && buf->b[elem])
-		str_removechar(buf->b[elem], index);
+		row_removechar(buf->b[elem], index);
 }
 
 static void
 buf_create(struct buf *buf, size_t size)
 {
 	/* create a new buffer. */
-	buf->b = ecalloc(size, sizeof(struct str *));
+	buf->b = ecalloc(size, sizeof(struct row *));
 	buf->len = 1;
 	buf->size = size;
 }
@@ -935,6 +978,23 @@ buf_elem_len(struct buf *buf, size_t elem)
 	 * doesn't exist.
 	 */
 	return (buf->b[elem]) ? buf->b[elem]->len : 0;
+}
+
+static size_t
+buf_elem_visual_len(struct buf *buf, size_t elem)
+{
+	/*
+	 * returns the length of an element of a buffer, or 0 if it
+	 * doesn't exist. tabs are TAB_WIDTH characters long instead of 1.
+	 */
+	if (!buf->b[elem])
+		return 0;
+
+	if (!buf->b[elem]->tabs)
+		return buf->b[elem]->len;
+	else
+		return (buf->b[elem]->len - buf->b[elem]->tabs) +
+			(buf->b[elem]->tabs * TAB_WIDTH);
 }
 
 static void
@@ -972,7 +1032,7 @@ buf_resize(struct buf *buf, size_t size)
 			}
 		}
 
-		buf->b = ereallocarray(buf->b, size, sizeof(struct str *));
+		buf->b = ereallocarray(buf->b, size, sizeof(struct row *));
 		buf->size = size;
 
 		if (size > oldsize) {
@@ -1000,7 +1060,7 @@ buf_shift_down(struct buf *buf, size_t start_index, size_t size_increment)
 		buf_resize(buf, buf->size + size_increment);
 
 	memmove(&buf->b[start_index + 1], &buf->b[start_index],
-			(buf->len - start_index) * sizeof(struct str *));
+			(buf->len - start_index) * sizeof(struct row *));
 	++buf->len;
 }
 
@@ -1016,7 +1076,7 @@ buf_shift_up(struct buf *buf, size_t start_index)
 	 * if start_index is 0, the behaviour is the same as if it was 1.
 	 */
 	memmove(&buf->b[start_index - 1], &buf->b[start_index],
-			(buf->len - start_index) * sizeof(struct str *));
+			(buf->len - start_index) * sizeof(struct row *));
 	buf->b[--buf->len] = NULL;
 }
 
@@ -1057,10 +1117,11 @@ buf_from_file(struct buf *buf, const char *filename)
 		l = strlen(s);
 		if (l && s[l - 1] == '\n')
 			s[--l] = '\0';
-		buf->b[elem] = emalloc(sizeof(struct str));
+		buf->b[elem] = emalloc(sizeof(struct row));
 		buf->b[elem]->s = s;
 		buf->b[elem]->size = n;
 		buf->b[elem]->len = l;
+		buf->b[elem]->tabs = count_tabs(s, l);
 	}
 	buf->len = elem;
 	fclose(f);
@@ -1127,17 +1188,48 @@ iov_write(struct iovec *iov, int *iovcnt, size_t iov_size, int writefd,
  * movement
  */
 static void
+cursor_fix_xpos(struct state *st)
+{
+	/* begin searching for valid tx values on the row starting from x */
+	size_t i = 0;
+	int valid_tx = 0;
+	int found = 0;
+	if (st->x == 0) {
+		st->tx = 0;
+		return;
+	}
+	for (; i < st->buf.b[st->y]->len; ++i) {
+		if (st->buf.b[st->y]->s[i] == '\t')
+			valid_tx += 8;
+		else
+			++valid_tx;
+		if (valid_tx >= st->tx) {
+			found = 1;
+			break;
+		}
+	}
+
+	/*
+	 * if we didn't find a valid tx value, valid_tx will be the visual
+	 * length of the row
+	 */
+	st->x = (int)i + found;
+	st->tx = valid_tx;
+}
+
+static void
 cursor_up(struct state *st)
 {
 	if (st->y) {
 		size_t elen = buf_elem_len(&st->buf, (size_t)--st->y);
 		if ((size_t)st->x > elen)
 			st->x = (int)elen;
+		cursor_fix_xpos(st);
 		if (st->ty)
 			--st->ty;
 		else
 			redraw(st, st->y, 0, st->h - 2);
-		term_set_cursor(st->x, st->ty);
+		term_set_cursor(st->tx, st->ty);
 	}
 }
 
@@ -1148,14 +1240,14 @@ cursor_down(struct state *st)
 		size_t elen = buf_elem_len(&st->buf, (size_t)++st->y);
 		if ((size_t)st->x > elen)
 			st->x = (int)elen;
-
+		cursor_fix_xpos(st);
 		if (st->ty < st->h - 2) {
 			++st->ty;
 		} else {
 			write(STDOUT_FILENO, "\r\n\r\n", 4);
 			redraw_row(st, st->y, st->h - 2);
 		}
-		term_set_cursor(st->x, st->ty);
+		term_set_cursor(st->tx, st->ty);
 	}
 }
 
@@ -1163,33 +1255,49 @@ static void
 cursor_right(struct state *st, int stopatlastchar)
 {
 	size_t l = buf_elem_len(&st->buf, (size_t)st->y);
-	if (stopatlastchar)
+	if (stopatlastchar && l)
 		--l;
-	if (st->x < st->w - 1 && (size_t)st->x < l)
-		term_set_cursor(++st->x, st->ty);
+	if (st->tx < st->w - 1 && (size_t)st->x < l) {
+		if (st->buf.b[st->y]->s[st->x] == '\t')
+			st->tx += 8;
+		else
+			++st->tx;
+		++st->x;
+		term_set_cursor(st->tx, st->ty);
+	}
 }
 
 static void
 cursor_left(struct state *st)
 {
-	if (st->x)
-		term_set_cursor(--st->x, st->ty);
+	if (st->x) {
+		if (st->buf.b[st->y]->s[--st->x] == '\t')
+			st->tx -= 8;
+		else
+			--st->tx;
+		term_set_cursor(st->tx, st->ty);
+	}
 }
 
 static void
 cursor_linestart(struct state *st)
 {
-	st->x = 0;
-	term_set_cursor(st->x, st->ty);
+	st->x = st->tx = 0;
+	term_set_cursor(st->tx, st->ty);
 }
 
 static void
 cursor_lineend(struct state *st, int stopbeforelastchar)
 {
 	st->x = (int)buf_elem_len(&st->buf, (size_t)st->y);
-	if (stopbeforelastchar && st->x)
-		--st->x;
-	term_set_cursor(st->x, st->ty);
+	st->tx = (int)buf_elem_visual_len(&st->buf, (size_t)st->y);
+	if (stopbeforelastchar && st->x) {
+		if (st->buf.b[st->y]->s[--st->x] == '\t')
+			st->tx -= 8;
+		else
+			--st->tx;
+	}
+	term_set_cursor(st->tx, st->ty);
 }
 
 static void
@@ -1197,7 +1305,7 @@ cursor_startnextrow(struct state *st, int stripextranewline)
 {
 	if (st->buf.len && (size_t)st->y < st->buf.len - 1) {
 		++st->y;
-		st->x = 0;
+		st->x = st->tx = 0;
 
 		if (st->ty < st->h - 2) {
 			++st->ty;
@@ -1208,7 +1316,7 @@ cursor_startnextrow(struct state *st, int stripextranewline)
 				write(STDOUT_FILENO, "\r\n\r\n", 4);
 			redraw_row(st, st->y, st->h - 2);
 		}
-		term_set_cursor(st->x, st->ty);
+		term_set_cursor(st->tx, st->ty);
 	}
 }
 
@@ -1217,11 +1325,12 @@ cursor_endpreviousrow(struct state *st)
 {
 	if (st->y) {
 		st->x = (int)buf_elem_len(&st->buf, (size_t)--st->y);
+		st->tx = (int)buf_elem_visual_len(&st->buf, (size_t)st->y);
 		if (st->ty)
 			--st->ty;
 		else
 			redraw(st, st->y, 0, st->h - 2);
-		term_set_cursor(st->x, st->ty);
+		term_set_cursor(st->tx, st->ty);
 	}
 }
 
@@ -1230,12 +1339,22 @@ cursor_nonblank(struct state *st)
 {
 	if (BUF_ELEM_NOTEMPTY(st->buf, st->y)) {
 		size_t l = st->buf.b[st->y]->len;
-		for (st->x = 0; st->x < (int)l; ++st->x)
+		st->tx = 0;
+		for (st->x = 0; st->x < (int)l; ++st->x) {
 			if (!isblank(st->buf.b[st->y]->s[st->x]))
 				break;
-		if (st->x == (int)l)
-			--st->x;
-		term_set_cursor(st->x, st->ty);
+			if (st->buf.b[st->y]->s[st->x] == '\t')
+				st->tx += TAB_WIDTH;
+			else
+				++st->tx;
+		}
+		if (st->x == (int)l) {
+			if (st->buf.b[st->y]->s[--st->x] == '\t')
+				st->tx -= 8;
+			else
+				--st->tx;
+		}
+		term_set_cursor(st->tx, st->ty);
 	}
 }
 
@@ -1364,6 +1483,32 @@ exec_cmd(struct state *st)
  * helper functions
  */
 static void
+draw_row(int y, struct row *s)
+{
+	if (y < 0)
+		return;
+	term_clear_row(y);
+	printf("\033[%d;1H\033[2K", y + 1);
+	if (s->tabs) {
+		size_t i = 0;
+		size_t tx = 0;
+		size_t maxtx = (s->len - s->tabs) + (s->tabs * TAB_WIDTH);
+		for (; i < s->len && tx < maxtx; ++i) {
+			if (s->s[i] == '\t') {
+				fputs(TAB_WIDTH_CHARS, stdout);
+				tx += TAB_WIDTH;
+			} else {
+				putchar(s->s[i]);
+				++tx;
+			}
+		}
+	} else {
+		fputs(s->s, stdout);
+	}
+	fflush(stdout);
+}
+
+static void
 insert_newline(struct state *st)
 {
 	if (BUF_ELEM_NOTEMPTY(st->buf, st->y) &&
@@ -1379,6 +1524,10 @@ insert_newline(struct state *st)
 
 		/* size of new row */
 		size_t newsize = newlen;
+
+		/* amount of tabs in new row */
+		size_t newtabs;
+
 		if (newsize % ROW_SIZE_INCREMENT == 0)
 			++newsize;
 		newsize = ROUNDUPTO(newsize, ROW_SIZE_INCREMENT);
@@ -1388,7 +1537,7 @@ insert_newline(struct state *st)
 				BUF_SIZE_INCREMENT);
 
 		/* create new row in the newly freed space */
-		st->buf.b[st->y + 1] = emalloc(sizeof(struct str));
+		st->buf.b[st->y + 1] = emalloc(sizeof(struct row));
 		st->buf.b[st->y + 1]->s = emalloc(newsize);
 
 		/*
@@ -1400,10 +1549,13 @@ insert_newline(struct state *st)
 		st->buf.b[st->y + 1]->s[newlen] = '\0';
 		st->buf.b[st->y + 1]->len = newlen;
 		st->buf.b[st->y + 1]->size = newsize;
+		st->buf.b[st->y + 1]->tabs = newtabs = count_tabs(
+				st->buf.b[st->y + 1]->s, newlen);
 
 		/* cut off the old row at the cursor */
 		st->buf.b[st->y]->s[st->x] = '\0';
 		st->buf.b[st->y]->len = (size_t)st->x;
+		st->buf.b[st->y]->tabs -= newtabs;
 
 		/* redraw screen */
 		redraw(st, st->y, st->ty, st->h - 2);
@@ -1445,7 +1597,7 @@ redraw_row(struct state *st, int y, int ty)
 {
 	if ((size_t)y < st->buf.len) {
 		if (BUF_ELEM_NOTEMPTY(st->buf, y))
-			term_print(0, ty, COLOR_DEFAULT, st->buf.b[y]->s);
+			draw_row(ty, st->buf.b[y]);
 		else
 			term_clear_row(ty);
 	} else {
@@ -1461,6 +1613,7 @@ remove_newline(struct state *st)
 				st->y - 1)) {
 		/* stick the current row to the end of the previous row */
 		size_t oldlen = st->buf.b[st->y - 1]->len;
+		size_t oldvlen = buf_elem_visual_len(&st->buf, (size_t)(st->y - 1));
 		size_t newlen = oldlen + st->buf.b[st->y]->len;
 
 		if (newlen >= st->buf.b[st->y - 1]->size) {
@@ -1483,6 +1636,7 @@ remove_newline(struct state *st)
 			free(st->buf.b[st->y]);
 		}
 		st->x = (int)oldlen;
+		st->tx = (int)oldvlen;
 		buf_shift_up(&st->buf, (size_t)(st->y + 1));
 	} else if (BUF_ELEM_NOTEMPTY(st->buf, st->y - 1)) {
 		/*
@@ -1494,6 +1648,7 @@ remove_newline(struct state *st)
 			free(st->buf.b[st->y]);
 		}
 		st->x = (int)st->buf.b[st->y - 1]->len;
+		st->tx = (int)buf_elem_visual_len(&st->buf, (size_t)st->y - 1);
 		buf_shift_up(&st->buf, (size_t)(st->y + 1));
 	} else {
 		/*
@@ -1511,7 +1666,7 @@ remove_newline(struct state *st)
 	if (st->ty)
 		--st->ty;
 	redraw(st, --st->y, st->ty, st->h - 2);
-	term_set_cursor(st->x, st->ty);
+	term_set_cursor(st->tx, st->ty);
 }
 
 /*
@@ -1529,27 +1684,39 @@ key_command_line(struct state *st)
 		st->cmd.s[0] = '\0';
 		st->cmd.len = 0;
 		term_clear_row(st->h - 1);
-		st->x = st->storedx;
-		term_set_cursor(st->x, st->ty);
+		st->tx = st->storedtx;
+		term_set_cursor(st->tx, st->ty);
 		break;
 	case KEY_ARROW_RIGHT:
 		/* move cursor right */
-		if (st->x < st->w - 1 && (size_t)(st->x - 1) <
+		if (st->tx < st->w - 1 && (size_t)(st->tx - 1) <
 				st->cmd.len)
-			term_set_cursor(++st->x, st->h - 1);
+			term_set_cursor(++st->tx, st->h - 1);
 		break;
 	case KEY_ARROW_LEFT:
 		/* move cursor left */
-		if (st->x > 1)
-			term_set_cursor(--st->x, st->h - 1);
+		if (st->tx > 1)
+			term_set_cursor(--st->tx, st->h - 1);
 		break;
 	case KEY_HOME:
-		st->x = 1;
-		term_set_cursor(st->x, st->h - 1);
+		st->tx = 1;
+		term_set_cursor(st->tx, st->h - 1);
 		break;
 	case KEY_END:
-		st->x = (int)(st->cmd.len + 1);
-		term_set_cursor(st->x, st->h - 1);
+		st->tx = (int)(st->cmd.len + 1);
+		term_set_cursor(st->tx, st->h - 1);
+		break;
+	case KEY_DELETE:
+		/*
+		 * remove char at cursor, if there's some
+		 * text on the current row
+		 */
+		if (st->cmd.len) {
+			row_removechar(&st->cmd, (size_t)(st->tx - 1));
+			term_printf(0, st->h - 1, COLOR_DEFAULT,
+					":%s", st->cmd.s);
+			term_set_cursor(st->tx, st->h - 1);
+		}
 		break;
 	case KEY_BACKSPACE:
 		/*
@@ -1557,11 +1724,11 @@ key_command_line(struct state *st)
 		 * at the beginning of the row and there's
 		 * some text on the current row
 		 */
-		if (st->x > 1 && st->cmd.len) {
-			str_removechar(&st->cmd, (size_t)(st->x - 2));
+		if (st->tx > 1 && st->cmd.len) {
+			row_removechar(&st->cmd, (size_t)(st->tx - 2));
 			term_printf(0, st->h - 1, COLOR_DEFAULT,
 					":%s", st->cmd.s);
-			term_set_cursor(--st->x, st->h - 1);
+			term_set_cursor(--st->tx, st->h - 1);
 		}
 		break;
 	case KEY_ENTER:
@@ -1571,30 +1738,18 @@ key_command_line(struct state *st)
 		st->mode = MODE_NORMAL;
 		st->cmd.s[0] = '\0';
 		st->cmd.len = 0;
-		st->x = st->storedx;
-		term_set_cursor(st->x, st->y);
-		break;
-	case KEY_DELETE:
-		/*
-		 * remove char at cursor, if there's some
-		 * text on the current row
-		 */
-		if (st->cmd.len) {
-			str_removechar(&st->cmd, (size_t)(st->x - 1));
-			term_printf(0, st->h - 1, COLOR_DEFAULT,
-					":%s", st->cmd.s);
-			term_set_cursor(st->x, st->h - 1);
-		}
+		st->tx = st->storedtx;
+		term_set_cursor(st->tx, st->y);
 		break;
 	case KEY_CHAR:
 		/* regular key */
-		if (st->x && st->x < st->w - 1) {
-			str_insertchar(&st->cmd, st->ev.ch,
-					(size_t)(st->x - 1),
+		if (st->tx && st->tx < st->w - 1) {
+			row_insertchar(&st->cmd, st->ev.ch,
+					(size_t)(st->tx - 1),
 					CMD_SIZE_INCREMENT);
 			term_printf(0, st->h - 1, COLOR_DEFAULT,
 					":%s", st->cmd.s);
-			term_set_cursor(++st->x, st->h - 1);
+			term_set_cursor(++st->tx, st->h - 1);
 		}
 		break;
 	default:
@@ -1611,7 +1766,7 @@ key_insert(struct state *st)
 		/* go into normal mode */
 		st->mode = MODE_NORMAL;
 		term_clear_row(st->h - 1);
-		term_set_cursor(st->x, st->ty);
+		term_set_cursor(st->tx, st->ty);
 		break;
 	case KEY_ARROW_UP:
 		cursor_up(st);
@@ -1631,28 +1786,6 @@ key_insert(struct state *st)
 	case KEY_END:
 		cursor_lineend(st, 1);
 		break;
-	case KEY_BACKSPACE:
-		/*
-		 * remove char behind cursor, if it's not
-		 * at the beginning of the row and there's
-		 * some text on the current row
-		 */
-		if (st->x && BUF_ELEM_NOTEMPTY(st->buf, st->y)) {
-			st->modified = 1;
-			buf_char_remove(&st->buf, (size_t)st->y,
-					(size_t)--st->x);
-			term_print(0, st->ty, COLOR_DEFAULT,
-					st->buf.b[st->y]->s);
-			term_set_cursor(st->x, st->ty);
-		} else if (st->x == 0 && st->y) {
-			st->modified = 1;
-			remove_newline(st);
-		}
-		break;
-	case KEY_ENTER:
-		st->modified = 1;
-		insert_newline(st);
-		break;
 	case KEY_DELETE:
 		/*
 		 * remove char at cursor, if there's some
@@ -1662,20 +1795,53 @@ key_insert(struct state *st)
 			st->modified = 1;
 			buf_char_remove(&st->buf, (size_t)st->y,
 					(size_t)st->x);
-			term_print(0, st->ty, COLOR_DEFAULT,
-					st->buf.b[st->y]->s);
-			term_set_cursor(st->x, st->ty);
+			draw_row(st->ty, st->buf.b[st->y]);
+			term_set_cursor(st->tx, st->ty);
+		}
+		break;
+	case KEY_BACKSPACE:
+		/*
+		 * remove char behind cursor, if it's not
+		 * at the beginning of the row and there's
+		 * some text on the current row
+		 */
+		if (st->x && BUF_ELEM_NOTEMPTY(st->buf, st->y)) {
+			if (st->buf.b[st->y]->s[--st->x] == '\t')
+				st->tx -= TAB_WIDTH;
+			else
+				--st->tx;
+			st->modified = 1;
+			buf_char_remove(&st->buf, (size_t)st->y,
+					(size_t)st->x);
+			draw_row(st->ty, st->buf.b[st->y]);
+			term_set_cursor(st->tx, st->ty);
+		} else if (st->x == 0 && st->y) {
+			st->modified = 1;
+			remove_newline(st);
+		}
+		break;
+	case KEY_ENTER:
+		st->modified = 1;
+		insert_newline(st);
+		break;
+	case KEY_TAB:
+		if (st->tx < st->w - TAB_WIDTH) {
+			st->modified = 1;
+			st->tx += 8;
+			buf_char_insert(&st->buf, (size_t)st->y, '\t',
+					(size_t)st->x++);
+			draw_row(st->ty, st->buf.b[st->y]);
+			term_set_cursor(st->tx, st->ty);
 		}
 		break;
 	case KEY_CHAR:
 		/* regular key */
-		if (st->x < st->w - 1) {
+		if (st->tx < st->w - 1) {
 			st->modified = 1;
 			buf_char_insert(&st->buf, (size_t)st->y, st->ev.ch,
-					(size_t)st->x);
-			term_print(0, st->ty, COLOR_DEFAULT,
-					st->buf.b[st->y]->s);
-			term_set_cursor(++st->x, st->ty);
+					(size_t)st->x++);
+			draw_row(st->ty, st->buf.b[st->y]);
+			term_set_cursor(++st->tx, st->ty);
 		}
 		break;
 	default:
@@ -1776,10 +1942,10 @@ key_normal(struct state *st)
 			break;
 		case ':':
 			st->mode = MODE_COMMAND_LINE;
-			st->storedx = st->x;
-			st->x = 1;
+			st->storedtx = st->tx;
+			st->tx = 1;
 			term_print(0, st->h - 1, COLOR_DEFAULT, ":");
-			term_set_cursor(st->x, st->h - 1);
+			term_set_cursor(st->tx, st->h - 1);
 			break;
 		}
 	default:
@@ -1806,13 +1972,15 @@ resized(struct state *st)
 	/* set new cursor position on-screen correctly */
 	if (st->x > st->w - 2)
 		st->x = st->w - 2;
+	if (st->tx > st->w - 2)
+		st->tx = st->w - 2;
 
 	if (st->ty < st->y && st->y <= st->h - 2)
 		st->ty = st->y;
 	else if (st->y > st->h - 2)
 		st->ty = st->h - 2;
 
-	term_set_cursor(st->x, st->ty);
+	term_set_cursor(st->tx, st->ty);
 }
 
 /*
@@ -1838,7 +2006,7 @@ run(int argc, char *argv[])
 	st.cmd.len = 0;
 	st.cmd.size = INITIAL_ROW_SIZE;
 
-	st.x = st.y = st.ty = st.storedx = 0;
+	st.x = st.y = st.ty = st.storedtx = 0;
 	st.mode = MODE_NORMAL;
 	st.name = (argc > 1) ? argv[1] : NULL;
 	st.name_needs_free = st.modified = st.written = st.done = 0;
