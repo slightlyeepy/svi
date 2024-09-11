@@ -161,11 +161,15 @@
 
 #endif /* ENABLE_NONPOSIX */
 
-#if defined(__dietlibc__) && defined(__x86_64__)
+#if defined(__dietlibc__) && defined(__x86_64__) && \
+	(defined(__STRICT_ANSI__) || __STDC_VERSION__ < 199900L)
 /* needed to work around a bug in dietlibc */
 #include <stdint.h>
 typedef uint64_t __u64;
-#endif /* defined(__dietlibc__) && defined(__x86_64__) */
+#endif /*
+	* defined(__dietlibc__) && defined(__x86_64__) && \
+	* (defined(__STRICT_ANSI__) || __STDC_VERSION__ < 199900L)
+	*/
 
 #if ENABLE_NONPOSIX
 #include <sys/ioctl.h>
