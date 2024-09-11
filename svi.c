@@ -159,8 +159,6 @@
 #define _BSD_SOURCE
 #endif /* defined(BSD) */
 
-#endif /* ENABLE_NONPOSIX */
-
 #if defined(__dietlibc__) && defined(__x86_64__) && \
 	(defined(__STRICT_ANSI__) || __STDC_VERSION__ < 199900L)
 /* needed to work around a bug in dietlibc */
@@ -170,6 +168,8 @@ typedef uint64_t __u64;
 	* defined(__dietlibc__) && defined(__x86_64__) && \
 	* (defined(__STRICT_ANSI__) || __STDC_VERSION__ < 199900L)
 	*/
+
+#endif /* ENABLE_NONPOSIX */
 
 #if ENABLE_NONPOSIX
 #include <sys/ioctl.h>
