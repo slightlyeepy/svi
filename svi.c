@@ -1620,7 +1620,8 @@ remove_newline(struct state *st)
 				st->y - 1)) {
 		/* stick the current row to the end of the previous row */
 		size_t oldlen = st->buf.b[st->y - 1]->len;
-		size_t oldvlen = buf_elem_visual_len(&st->buf, (size_t)(st->y - 1));
+		size_t oldvlen = buf_elem_visual_len(&st->buf,
+				(size_t)(st->y - 1));
 		size_t newlen = oldlen + st->buf.b[st->y]->len;
 
 		if (newlen >= st->buf.b[st->y - 1]->size) {
