@@ -2067,10 +2067,10 @@ main(int argc, char *argv[])
 	if (argc)
 		argv0 = argv[0];
 
-#if ENABLE_PLEDGE
+#if ENABLE_NONPOSIX && ENABLE_PLEDGE
 	if (pledge("stdio rpath wpath cpath tty", NULL) < 0)
 		die("pledge:");
-#endif /* ENABLE_PLEDGE */
+#endif /* ENABLE_NONPOSIX && ENABLE_PLEDGE */
 
 	term_init();
 	run(argc, argv);
