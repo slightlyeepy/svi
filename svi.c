@@ -393,10 +393,14 @@ static void run(int argc, char *argv[]);
  */
 static const char *argv0 = NULL;
 
+/* 0 = no, 1 = terminal mode set, 2 = stdin set to nonblocking mode */
+static int term_init_stage = 0;
+
 /* terminal state */
-static int term_initialized = 0;
 static struct termios tio, oldtio;
 static int old_stdin_flags;
+
+/* SIGWINCH handling */
 #if ENABLE_NONPOSIX && defined(SIGWINCH)
 static volatile sig_atomic_t win_resized = 0;
 static sigset_t oldmask;
@@ -462,7 +466,7 @@ die(const char *fmt, ...)
 {
 	va_list ap;
 	va_start(ap, fmt);
-	if (term_initialized)
+	if (term_init_stage)
 		term_shutdown();
 	if (fmt) {
 		if (argv0)
@@ -665,12 +669,14 @@ term_init(void)
 
 	if (tcsetattr(STDIN_FILENO, TCSANOW, &tio) < 0)
 		die("tcsetattr:");
+	++term_init_stage;
 
 	/* set non-blocking mode for stdin */
 	if ((old_stdin_flags = fcntl(STDIN_FILENO, F_GETFL, 0)) < 0)
 		die("fcntl:");
 	if (fcntl(STDIN_FILENO, F_SETFL, old_stdin_flags | O_NONBLOCK) < 0)
 		die("fcntl:");
+	++term_init_stage;
 
 #if ENABLE_NONPOSIX && defined(SIGWINCH)
 	/* set handler for SIGWINCH */
@@ -688,7 +694,6 @@ term_init(void)
 #endif /* ENABLE_NONPOSIX && defined(SIGWINCH) */
 
 	write(STDOUT_FILENO, "\033[2J", 4);
-	term_initialized = 1;
 }
 
 static void
@@ -744,11 +749,13 @@ static void
 term_shutdown(void)
 {
 	/* avoid infinite recursion with die() if something fails */
-	term_initialized = 0;
+	int stage = term_init_stage;
+	term_init_stage = 0;
 
-	if (tcsetattr(STDIN_FILENO, TCSANOW, &oldtio) < 0)
+	if (stage && tcsetattr(STDIN_FILENO, TCSANOW, &oldtio) < 0)
 		die("tcsetattr:");
-	if (fcntl(STDIN_FILENO, F_SETFL, old_stdin_flags) < 0)
+
+	if (stage > 1 && fcntl(STDIN_FILENO, F_SETFL, old_stdin_flags) < 0)
 		die("fcntl:");
 
 	write(STDOUT_FILENO, "\033[2J\033[;H", 8);
