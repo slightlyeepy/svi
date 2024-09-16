@@ -223,34 +223,34 @@ enum event_type {
 	TERM_EVENT_KEY
 };
 
-enum key {
+enum term_key {
 	/* esc */
-	KEY_ESC,
+	TERM_KEY_ESC,
 
 	/* movement keys */
-	KEY_ARROW_UP,
-	KEY_ARROW_DOWN,
-	KEY_ARROW_RIGHT,
-	KEY_ARROW_LEFT,
-	KEY_HOME,
-	KEY_END,
+	TERM_KEY_ARROW_UP,
+	TERM_KEY_ARROW_DOWN,
+	TERM_KEY_ARROW_RIGHT,
+	TERM_KEY_ARROW_LEFT,
+	TERM_KEY_HOME,
+	TERM_KEY_END,
 
 	/* misc */
-	KEY_INSERT,
-	KEY_DELETE,
-	KEY_PAGE_UP,
-	KEY_PAGE_DOWN,
+	TERM_KEY_INSERT,
+	TERM_KEY_DELETE,
+	TERM_KEY_PAGE_UP,
+	TERM_KEY_PAGE_DOWN,
 
 	/* backspace/enter */
-	KEY_BACKSPACE,
-	KEY_ENTER,
+	TERM_KEY_BACKSPACE,
+	TERM_KEY_ENTER,
 
 	/* tab */
-	KEY_TAB,
+	TERM_KEY_TAB,
 
 	/* ctrl+<key> / regular key */
-	KEY_CTRL,
-	KEY_CHAR
+	TERM_KEY_CTRL,
+	TERM_KEY_CHAR
 };
 
 enum mode {
@@ -262,7 +262,7 @@ enum mode {
 /* structs */
 struct term_event {
 	enum event_type type;
-	enum key key;
+	enum term_key key;
 	char ch;
 };
 
@@ -502,84 +502,84 @@ readkey(struct term_event *ev)
 				switch (c) {
 				case 'A':
 					/* <esc>[A = up arrow */
-					ev->key = KEY_ARROW_UP;
+					ev->key = TERM_KEY_ARROW_UP;
 					return;
 				case 'B':
 					/* <esc>[B = down arrow */
-					ev->key = KEY_ARROW_DOWN;
+					ev->key = TERM_KEY_ARROW_DOWN;
 					return;
 				case 'C':
 					/* <esc>[C = right arrow */
-					ev->key = KEY_ARROW_RIGHT;
+					ev->key = TERM_KEY_ARROW_RIGHT;
 					return;
 				case 'D':
 					/* <esc>[D = left arrow */
-					ev->key = KEY_ARROW_LEFT;
+					ev->key = TERM_KEY_ARROW_LEFT;
 					return;
 				case 'H':
 					/* <esc>[H = home */
-					ev->key = KEY_HOME;
+					ev->key = TERM_KEY_HOME;
 					return;
 				case 'F':
 					/* <esc>[F = end */
-					ev->key = KEY_END;
+					ev->key = TERM_KEY_END;
 					return;
 				case '2':
 					if (try_read_chr(&c) && c == '~') {
 						/* <esc>[2~ = insert */
-						ev->key = KEY_INSERT;
+						ev->key = TERM_KEY_INSERT;
 						return;
 					}
 					break;
 				case '3':
 					if (try_read_chr(&c) && c == '~') {
 						/* <esc>[3~ = delete */
-						ev->key = KEY_DELETE;
+						ev->key = TERM_KEY_DELETE;
 						return;
 					}
 					break;
 				case '5':
 					if (try_read_chr(&c) && c == '~') {
 						/* <esc>[5~ = page up */
-						ev->key = KEY_PAGE_UP;
+						ev->key = TERM_KEY_PAGE_UP;
 						return;
 					}
 					break;
 				case '6':
 					if (try_read_chr(&c) && c == '~') {
 						/* <esc>[6~ = page down */
-						ev->key = KEY_PAGE_DOWN;
+						ev->key = TERM_KEY_PAGE_DOWN;
 						return;
 					}
 					break;
 				}
 			} else {
 				/* it's just esc */
-				ev->key = KEY_ESC;
+				ev->key = TERM_KEY_ESC;
 				return;
 			}
 			break;
 		case 127:
 			/* <DEL> = backspace */
-			ev->key = KEY_BACKSPACE;
+			ev->key = TERM_KEY_BACKSPACE;
 			return;
 		case '\r':
 			/* carriage return = enter */
-			ev->key = KEY_ENTER;
+			ev->key = TERM_KEY_ENTER;
 			return;
 		case '\011':
 			/* <ht>, horizontal tab */
-			ev->key = KEY_TAB;
+			ev->key = TERM_KEY_TAB;
 			return;
 		default:
 			if (c < 0x20) {
 				/* ctrl+<something> */
-				ev->key = KEY_CTRL;
+				ev->key = TERM_KEY_CTRL;
 				ev->ch = c + 0x40;
 				return;
 			} else if (c < 0x7f) {
 				/* regular ASCII char */
-				ev->key = KEY_CHAR;
+				ev->key = TERM_KEY_CHAR;
 				ev->ch = c;
 				return;
 			}
@@ -1693,7 +1693,7 @@ key_command_line(struct state *st)
 {
 	/* handle a key event in command-line mode. */
 	switch (st->ev.key) {
-	case KEY_ESC:
+	case TERM_KEY_ESC:
 		/* discard command and return to normal mode */
 		st->mode = MODE_NORMAL;
 		st->cmd.s[0] = '\0';
@@ -1702,26 +1702,26 @@ key_command_line(struct state *st)
 		st->tx = st->storedtx;
 		term_set_cursor(st->tx, st->ty);
 		break;
-	case KEY_ARROW_RIGHT:
+	case TERM_KEY_ARROW_RIGHT:
 		/* move cursor right */
 		if (st->tx < st->w - 1 && (size_t)(st->tx - 1) <
 				st->cmd.len)
 			term_set_cursor(++st->tx, st->h - 1);
 		break;
-	case KEY_ARROW_LEFT:
+	case TERM_KEY_ARROW_LEFT:
 		/* move cursor left */
 		if (st->tx > 1)
 			term_set_cursor(--st->tx, st->h - 1);
 		break;
-	case KEY_HOME:
+	case TERM_KEY_HOME:
 		st->tx = 1;
 		term_set_cursor(st->tx, st->h - 1);
 		break;
-	case KEY_END:
+	case TERM_KEY_END:
 		st->tx = (int)(st->cmd.len + 1);
 		term_set_cursor(st->tx, st->h - 1);
 		break;
-	case KEY_DELETE:
+	case TERM_KEY_DELETE:
 		/*
 		 * remove char at cursor, if there's some
 		 * text on the current row
@@ -1733,7 +1733,7 @@ key_command_line(struct state *st)
 			term_set_cursor(st->tx, st->h - 1);
 		}
 		break;
-	case KEY_BACKSPACE:
+	case TERM_KEY_BACKSPACE:
 		/*
 		 * remove char behind cursor, if it's not
 		 * at the beginning of the row and there's
@@ -1746,7 +1746,7 @@ key_command_line(struct state *st)
 			term_set_cursor(--st->tx, st->h - 1);
 		}
 		break;
-	case KEY_ENTER:
+	case TERM_KEY_ENTER:
 		/* execute command and return to normal mode */
 		if (exec_cmd(st) >= 0)
 			term_clear_row(st->h - 1);
@@ -1756,7 +1756,7 @@ key_command_line(struct state *st)
 		st->tx = st->storedtx;
 		term_set_cursor(st->tx, st->y);
 		break;
-	case KEY_CHAR:
+	case TERM_KEY_CHAR:
 		/* regular key */
 		if (st->tx && st->tx < st->w - 1) {
 			row_insertchar(&st->cmd, st->ev.ch,
@@ -1777,31 +1777,31 @@ key_insert(struct state *st)
 {
 	/* handle a key event in insert mode. */
 	switch (st->ev.key) {
-	case KEY_ESC:
+	case TERM_KEY_ESC:
 		/* go into normal mode */
 		st->mode = MODE_NORMAL;
 		term_clear_row(st->h - 1);
 		term_set_cursor(st->tx, st->ty);
 		break;
-	case KEY_ARROW_UP:
+	case TERM_KEY_ARROW_UP:
 		cursor_up(st);
 		break;
-	case KEY_ARROW_DOWN:
+	case TERM_KEY_ARROW_DOWN:
 		cursor_down(st);
 		break;
-	case KEY_ARROW_RIGHT:
+	case TERM_KEY_ARROW_RIGHT:
 		cursor_right(st, 1);
 		break;
-	case KEY_ARROW_LEFT:
+	case TERM_KEY_ARROW_LEFT:
 		cursor_left(st);
 		break;
-	case KEY_HOME:
+	case TERM_KEY_HOME:
 		cursor_linestart(st);
 		break;
-	case KEY_END:
+	case TERM_KEY_END:
 		cursor_lineend(st, 1);
 		break;
-	case KEY_DELETE:
+	case TERM_KEY_DELETE:
 		/*
 		 * remove char at cursor, if there's some
 		 * text on the current row
@@ -1814,7 +1814,7 @@ key_insert(struct state *st)
 			term_set_cursor(st->tx, st->ty);
 		}
 		break;
-	case KEY_BACKSPACE:
+	case TERM_KEY_BACKSPACE:
 		/*
 		 * remove char behind cursor, if it's not
 		 * at the beginning of the row and there's
@@ -1835,11 +1835,11 @@ key_insert(struct state *st)
 			remove_newline(st);
 		}
 		break;
-	case KEY_ENTER:
+	case TERM_KEY_ENTER:
 		st->modified = 1;
 		insert_newline(st);
 		break;
-	case KEY_TAB:
+	case TERM_KEY_TAB:
 		if (st->tx < st->w - TAB_WIDTH) {
 			st->modified = 1;
 			st->tx += 8;
@@ -1849,7 +1849,7 @@ key_insert(struct state *st)
 			term_set_cursor(st->tx, st->ty);
 		}
 		break;
-	case KEY_CHAR:
+	case TERM_KEY_CHAR:
 		/* regular key */
 		if (st->tx < st->w - 1) {
 			st->modified = 1;
@@ -1869,43 +1869,43 @@ key_normal(struct state *st)
 {
 	/* handle a key event in normal mode. */
 	switch (st->ev.key) {
-	case KEY_ARROW_UP:
+	case TERM_KEY_ARROW_UP:
 		cursor_up(st);
 		break;
-	case KEY_ARROW_DOWN:
+	case TERM_KEY_ARROW_DOWN:
 		cursor_down(st);
 		break;
-	case KEY_ARROW_RIGHT:
+	case TERM_KEY_ARROW_RIGHT:
 		cursor_right(st, 1);
 		break;
-	case KEY_ARROW_LEFT:
+	case TERM_KEY_ARROW_LEFT:
 		cursor_left(st);
 		break;
-	case KEY_HOME:
+	case TERM_KEY_HOME:
 		cursor_linestart(st);
 		break;
-	case KEY_END:
+	case TERM_KEY_END:
 		cursor_lineend(st, 1);
 		break;
-	case KEY_INSERT:
+	case TERM_KEY_INSERT:
 		st->mode = MODE_INSERT;
 		break;
-	case KEY_BACKSPACE:
+	case TERM_KEY_BACKSPACE:
 		/* move to previous char */
 		if (st->x == 0 && st->y)
 			cursor_endpreviousrow(st);
 		else
 			cursor_left(st);
 		break;
-	case KEY_ENTER:
+	case TERM_KEY_ENTER:
 		cursor_startnextrow(st, 0);
 		break;
-	case KEY_CTRL:
+	case TERM_KEY_CTRL:
 		if (st->ev.ch == 'L')
 			/* clear and redraw screen */
 			resized(st);
 		break;
-	case KEY_CHAR:
+	case TERM_KEY_CHAR:
 		switch (st->ev.ch) {
 		case 'h':
 			cursor_left(st);
