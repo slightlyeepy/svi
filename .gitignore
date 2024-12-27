@@ -1,6 +1,2 @@
-# debugging stuff that isnt part of the program
-*log*
-
-# compilation products
 svi
 *.o
