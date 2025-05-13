@@ -28,7 +28,6 @@
 /*
  * todo (from highest to lowest priority):
  * - clean up codebase, shorten some long lines
- * - add support for scrolling up/down whole pages
  * - add support for <count><movement> (e.g 5j to move down 5 rows)
  * - horizontal scrolling for long lines
  * - add support for more movement keys
@@ -365,6 +364,8 @@ static void cursor_lineend(struct state *st, int stopbeforelastchar);
 static void cursor_startnextrow(struct state *st, int stripextranewline);
 static void cursor_endpreviousrow(struct state *st);
 static void cursor_nonblank(struct state *st);
+static void cursor_up_page(struct state *st);
+static void cursor_down_page(struct state *st);
 
 /* commands */
 static const char *cmdarg(const char *cmd);
@@ -1372,6 +1373,55 @@ cursor_nonblank(struct state *st)
 	}
 }
 
+static void
+cursor_up_page(struct state *st)
+{
+	if (st->y - st->ty > 0) {
+		/*
+		 * now, you might think that this is written rly badly;
+		 * this is because it is, i have no idea what i was doing,
+		 * i just mimicked neovim's behavior
+		 */
+
+		size_t elen;
+		int redrawpos = st->y - (st->h - 2) - (st->ty - 1);
+		if (redrawpos < 0)
+			redrawpos = 0;
+		st->y -= st->h - 3;
+		if (st->y < st->h - 2)
+			st->y = st->h - 2;
+		elen = buf_elem_len(&st->buf, (size_t)st->y);
+		if ((size_t)st->x > elen)
+			st->x = (int)elen;
+		cursor_fix_xpos(st);
+		st->ty = st->h - 2;
+		redraw(st, redrawpos, 0, st->h - 2);
+		term_set_cursor(st->tx, st->ty);
+	}
+}
+
+static void
+cursor_down_page(struct state *st)
+{
+	if (st->buf.len && (size_t)st->y < st->buf.len - 1) {
+		/*
+		 * this was self-written but i have no idea what
+		 * i was doing here either
+		 */
+		size_t elen;
+		st->y += st->h - 3;
+		if ((size_t)st->y > st->buf.len - 1)
+			st->y = (int)st->buf.len - 1;
+		elen = buf_elem_len(&st->buf, (size_t)st->y);
+		if ((size_t)st->x > elen)
+			st->x = (int)elen;
+		cursor_fix_xpos(st);
+		st->ty = 0;
+		redraw(st, st->y, 0, st->h - 2);
+		term_set_cursor(st->tx, st->ty);
+	}
+}
+
 /*
  * ============================================================================
  * commands
@@ -1814,6 +1864,12 @@ key_insert(struct state *st)
 			term_set_cursor(st->tx, st->ty);
 		}
 		break;
+	case TERM_KEY_PAGE_UP:
+		cursor_up_page(st);
+		break;
+	case TERM_KEY_PAGE_DOWN:
+		cursor_down_page(st);
+		break;
 	case TERM_KEY_BACKSPACE:
 		/*
 		 * remove char behind cursor, if it's not
@@ -1890,6 +1946,25 @@ key_normal(struct state *st)
 	case TERM_KEY_INSERT:
 		st->mode = MODE_INSERT;
 		break;
+	case TERM_KEY_DELETE:
+		/*
+		 * remove char at cursor, if there's some
+		 * text on the current row
+		 */
+		if (BUF_ELEM_NOTEMPTY(st->buf, st->y)) {
+			st->modified = 1;
+			buf_char_remove(&st->buf, (size_t)st->y,
+					(size_t)st->x);
+			draw_row(st->ty, st->buf.b[st->y]);
+			term_set_cursor(st->tx, st->ty);
+		}
+		break;
+	case TERM_KEY_PAGE_UP:
+		cursor_up_page(st);
+		break;
+	case TERM_KEY_PAGE_DOWN:
+		cursor_down_page(st);
+		break;
 	case TERM_KEY_BACKSPACE:
 		/* move to previous char */
 		if (st->x == 0 && st->y)
@@ -1901,9 +1976,20 @@ key_normal(struct state *st)
 		cursor_startnextrow(st, 0);
 		break;
 	case TERM_KEY_CTRL:
-		if (st->ev.ch == 'L')
+		switch (st->ev.ch) {
+		case 'L':
 			/* clear and redraw screen */
 			resized(st);
+			break;
+		case 'b':
+			/* page up */
+			cursor_up_page(st);
+			break;
+		case 'f':
+			/* page down */
+			cursor_down_page(st);
+			break;
+		}
 		break;
 	case TERM_KEY_CHAR:
 		switch (st->ev.ch) {
@@ -1955,6 +2041,19 @@ key_normal(struct state *st)
 			insert_newline(st);
 			st->mode = MODE_INSERT;
 			break;
+		case 'x':
+			/*
+			 * remove char at cursor, if there's some
+			 * text on the current row
+			 */
+			if (BUF_ELEM_NOTEMPTY(st->buf, st->y)) {
+				st->modified = 1;
+				buf_char_remove(&st->buf, (size_t)st->y,
+						(size_t)st->x);
+				draw_row(st->ty, st->buf.b[st->y]);
+				term_set_cursor(st->tx, st->ty);
+			}
+			break;
 		case ':':
 			st->mode = MODE_COMMAND_LINE;
 			st->storedtx = st->tx;
@@ -1963,6 +2062,7 @@ key_normal(struct state *st)
 			term_set_cursor(st->tx, st->h - 1);
 			break;
 		}
+		break;
 	default:
 		break;
 	}
